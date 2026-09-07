@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "smartops"
+version = "0.12.0"
+description = "Local-first telemetry, predictive alerts, notifications, and centralized settings"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115,<1.0",
+    "psutil>=5.9,<8.0",
+    "scikit-learn>=1.5,<1.8",
+    "uvicorn[standard]>=0.30,<1.0",
+    "windows-toasts>=1.3,<2.0; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+dev = [
+    "httpx>=0.27,<1.0",
+    "pytest>=8.0,<10.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["agent*", "backend*", "analytics*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

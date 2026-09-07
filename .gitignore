@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+*.egg-info/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# SmartOps-generated local data
+data/*
+!data/.gitkeep
+
+# Local tooling and editor files
+.tools/
+.env
+.vscode/
+

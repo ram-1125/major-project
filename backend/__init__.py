@@ -1,0 +1,2 @@
+"""SmartOps local FastAPI backend."""
+
