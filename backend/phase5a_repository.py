@@ -6,7 +6,10 @@ import json
 import sqlite3
 from typing import Any
 
-from backend.postcalibration_repository import get_alert_snapshot, latest_outcome
+from backend.postcalibration_repository import (
+    get_alert_snapshot,
+    latest_outcome_for_alert,
+)
 
 
 JSON_FIELDS = (
@@ -60,10 +63,7 @@ def _expand_alert(
         ORDER BY observed_at_utc DESC, id DESC LIMIT 1""",
         (item["id"],),
     ).fetchone()
-    item["outcome"] = (
-        latest_outcome(connection, int(latest_occurrence_row["id"]))
-        if latest_occurrence_row else None
-    )
+    item["outcome"] = latest_outcome_for_alert(connection, int(item["id"]))
     if not full:
         item["summary_record"] = True
         item["evidence"] = []
@@ -75,8 +75,20 @@ def _expand_alert(
         item["notification_deliveries"] = []
         return item
     item["summary_record"] = False
-    occurrence = latest_occurrence_row
+    # Recovery rows are essential lifecycle evidence, but normally contain no
+    # trigger evidence or guidance. Read explanation content from the latest
+    # material condition occurrence instead of the final recovery poll.
+    occurrence = connection.execute(
+        """SELECT occurrence.* FROM alert_occurrences occurrence
+        WHERE occurrence.alert_id = ? AND occurrence.condition_met = 1
+        ORDER BY EXISTS(
+          SELECT 1 FROM alert_evidence evidence
+          WHERE evidence.occurrence_id = occurrence.id
+        ) DESC, occurrence.observed_at_utc DESC, occurrence.id DESC LIMIT 1""",
+        (item["id"],),
+    ).fetchone()
     item["latest_occurrence"] = dict(occurrence) if occurrence else None
+    item["material_occurrence"] = dict(occurrence) if occurrence else None
     item["evidence"] = []
     item["explanations"] = []
     item["diagnostic_recommendations"] = []
@@ -176,6 +188,8 @@ def get_alerts(
     severity: str | None = None,
     state: str | None = None,
     workload: str | None = None,
+    search: str | None = None,
+    view: str | None = None,
     *,
     full: bool = True,
 ) -> tuple[list[dict[str, Any]], int]:
@@ -193,6 +207,23 @@ def get_alerts(
         if value is not None:
             clauses.append(sql)
             values.append(value)
+    if search and search.strip():
+        clauses.append(
+            "(title LIKE ? ESCAPE '\\' COLLATE NOCASE "
+            "OR alert_code LIKE ? ESCAPE '\\' COLLATE NOCASE "
+            "OR category LIKE ? ESCAPE '\\' COLLATE NOCASE "
+            "OR workload_context LIKE ? ESCAPE '\\' COLLATE NOCASE "
+            "OR description LIKE ? ESCAPE '\\' COLLATE NOCASE)"
+        )
+        escaped = search.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{escaped}%"
+        values.extend([pattern] * 5)
+    if view == "attention":
+        # Low and Elevated records remain available in Observations/All, but
+        # do not compete visually with actionable High/Critical Evidence.
+        clauses.append("current_severity IN ('warning', 'urgent')")
+    elif view == "observations":
+        clauses.append("current_severity IN ('informational', 'advisory')")
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     total = int(
         connection.execute(
@@ -200,9 +231,15 @@ def get_alerts(
         ).fetchone()[0]
     )
     direction = "ASC" if sort == "oldest" else "DESC"
+    order = (
+        "CASE current_severity WHEN 'urgent' THEN 4 WHEN 'warning' THEN 3 "
+        "WHEN 'advisory' THEN 2 ELSE 1 END DESC, latest_observed_utc DESC, id DESC"
+        if sort == "severity"
+        else f"latest_observed_utc {direction}, id {direction}"
+    )
     rows = connection.execute(
         f"""SELECT * FROM alerts {where}
-        ORDER BY latest_observed_utc {direction}, id {direction}
+        ORDER BY {order}
         LIMIT ? OFFSET ?""",
         (*values, limit, offset),
     ).fetchall()

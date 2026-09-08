@@ -4807,6 +4807,57 @@ footer {
   }
 }
 
+.technical-evidence-page { display: grid; min-width: 0; gap: var(--space-5); }
+.technical-evidence-intro { display: flex; align-items: center; gap: var(--space-4); padding: var(--space-5); border: 1px solid var(--color-border); border-radius: var(--radius-lg); background: var(--color-surface); box-shadow: var(--shadow-card); }
+.technical-evidence-intro > svg { flex: 0 0 auto; width: 34px; height: 34px; padding: 8px; color: var(--color-primary); background: rgba(15, 120, 181, 0.12); border-radius: 10px; }
+.technical-evidence-intro > div { min-width: 0; }
+.technical-evidence-intro h2, .technical-evidence-intro p { margin: 0; }
+.technical-evidence-intro p, .technical-evidence-toolbar p, .stale-banner span { min-width: 0; overflow-wrap: anywhere; }
+.technical-evidence-intro > span { margin-left: auto; padding: 5px 10px; border-radius: 999px; color: var(--color-success); background: rgba(18, 132, 90, 0.12); font-weight: 700; }
+.technical-evidence-tabs { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 4px; }
+.technical-evidence-tabs button { white-space: nowrap; }
+.technical-evidence-tabs button[aria-selected="true"] { color: white; border-color: var(--color-primary); background: var(--color-primary); }
+.technical-evidence-toolbar { display: flex; align-items: end; justify-content: space-between; gap: var(--space-4); }
+.technical-evidence-toolbar label { display: grid; gap: 5px; min-width: min(420px, 100%); }
+.technical-evidence-toolbar label > div { display: flex; align-items: center; gap: 8px; padding: 0 10px; border: 1px solid var(--color-border); border-radius: var(--radius-md); background: white; }
+.technical-evidence-toolbar input { width: 100%; border: 0; box-shadow: none; }
+.technical-evidence-page pre { max-width: min(720px, 70vw); max-height: 360px; overflow: auto; white-space: pre-wrap; word-break: break-word; }
+.technical-evidence-page td { max-width: 260px; overflow-wrap: anywhere; }
+.enhanced-signal-groups { display: grid; gap: var(--space-5); }
+.enhanced-signal-group { min-width: 0; }
+.enhanced-signal-group > h3 { margin: 0 0 var(--space-3); color: var(--color-navy-800); text-transform: capitalize; }
+.process-bars { display: grid; gap: 10px; margin-top: var(--space-3); }
+.process-bar { display: grid; gap: 4px; padding: 3px; border-radius: var(--radius-sm); }
+.process-bar:focus-visible { outline: 3px solid var(--focus-ring); }
+.process-bar > div { display: flex; justify-content: space-between; gap: 12px; }
+.process-bar > div strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.process-bar > i { display: block; height: 8px; overflow: hidden; border-radius: 999px; background: var(--color-surface-subtle); }
+.process-bar > i > span { display: block; height: 100%; min-width: 2px; border-radius: inherit; }
+.process-bar--other > i > span { background: var(--color-text-tertiary); }
+.process-snapshot-note { color: var(--color-text-secondary); font-size: 0.86rem; }
+.outcome-choice-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.outcome-choice-grid button { display: grid; gap: 3px; min-height: 62px; text-align: left; }
+.outcome-choice-grid button span { font-size: 0.82rem; font-weight: 400; }
+.outcome-choice-grid button[aria-pressed="true"] { border-color: var(--color-primary); background: rgba(15, 120, 181, 0.08); }
+.alert-context-links, .analysis-related-links { display: flex; flex-wrap: wrap; gap: 10px; }
+.technical-evidence-link { display: inline-flex; margin-top: var(--space-3); }
+.application-attribution > p { max-width: 80ch; }
+.alert-card > footer .alert-version-details,
+.alert-card > footer .alert-report-link { display: none; }
+@media (max-width: 768px) {
+  .technical-evidence-intro, .technical-evidence-toolbar { align-items: flex-start; flex-direction: column; }
+  .technical-evidence-intro > span { margin-left: 0; }
+  .outcome-choice-grid { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 620px) {
+  .topbar__identity { width: auto; min-width: 0; flex: 1 1 auto; }
+  .header-actions { min-width: 0; flex: 0 0 auto; }
+  .technical-evidence-toolbar,
+  .technical-evidence-toolbar label,
+  .technical-evidence-toolbar p { width: 100%; min-width: 0; }
+}
+
 @media (max-width: 1180px) {
   .app-shell__body {
     grid-template-columns: 214px minmax(0, 1fr);

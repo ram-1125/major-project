@@ -25,6 +25,21 @@ def test_phase_one_endpoints_remain_available_with_empty_database(tmp_path: Path
     assert history_response.json()["total"] == 0
 
 
+def test_technical_evidence_catalogue_is_read_only_bounded_and_keeps_audit_records_in_settings(tmp_path: Path):
+    database_path = tmp_path / "technical.db"
+    with TestClient(create_app(database_path)) as client:
+        catalogue = client.get("/api/technical-evidence")
+        page = client.get("/api/technical-evidence/analytical-records", params={"limit": 25, "offset": 0})
+        excessive = client.get("/api/technical-evidence/monitoring", params={"limit": 101})
+    assert catalogue.status_code == 200
+    assert catalogue.json()["read_only"] is True
+    assert catalogue.json()["audit_records_location"] == "settings"
+    assert page.status_code == 200
+    assert page.json()["items"] == []
+    assert page.json()["read_only"] is True
+    assert excessive.status_code == 422
+
+
 def test_pc_quality_taxonomy_and_score_apis_return_all_supported_profiles(
     tmp_path: Path,
 ):

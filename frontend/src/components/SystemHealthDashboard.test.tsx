@@ -29,10 +29,10 @@ const health: HealthRecord = {
   trend_direction: "stable",
   recovery_state: "not_recovering",
   components: [{ id: 1, component_name: "resource_condition", component_score: 80, configured_weight: 45, effective_weight: 0.45, available_subcomponent_weight: 100, excluded_subcomponent_weight: 0, raw_deduction_total: 20, effective_deduction_total: 20, data_quality_status: "sufficient", reason_codes: ["ram_pressure_observed"], details: {} }],
-  deductions: [{ id: 3, component_name: "resource_condition", contribution_group: "memory_and_swap", signal_name: "ram_pressure", raw_deduction: 12, effective_deduction: 12, maximum_deduction: 70, correlation_or_cap_reason: "combined_cap", reason_code: "ram_pressure_observed", explanation: "RAM pressure reduced the component.", supporting_value: { average: 87.3, slope: 0.2 }, supporting_event_ids: [], workload_context: "development" }],
+  deductions: [{ id: 3, component_name: "resource_condition", contribution_group: "memory_and_swap", signal_name: "ram_pressure", raw_deduction: 12, effective_deduction: 12, maximum_deduction: 70, correlation_or_cap_reason: "combined_cap", reason_code: "ram_pressure_observed", explanation: "Phase 3B RAM pressure reduced the component.", supporting_value: { average: 87.3, slope: 0.2 }, supporting_event_ids: [], workload_context: "development" }],
   inputs: [],
   excluded_inputs: [{ input_name: "cpu_temperature_avg", input_category: "optional_sensor", availability_status: "unavailable_optional", observed_value: null, excluded_reason: "sensor_unavailable", applicable_weight: 10 }],
-  guidance: { explanations: [], recommendations: [{ guidance_type: "recommendation", related_component: "memory", sequence: 1, guidance_text: "Review top memory processes." }], improvements: [], limitations: [{ guidance_type: "limitation", related_component: "", sequence: 1, guidance_text: "This is not a future reliability guarantee." }] },
+  guidance: { explanations: [], recommendations: [{ guidance_type: "recommendation", related_component: "memory", sequence: 1, guidance_text: "Review Phase 3A top memory processes." }], improvements: [], limitations: [{ guidance_type: "limitation", related_component: "", sequence: 1, guidance_text: "Phase 7B is not a future reliability guarantee." }] },
   baseline_reference: { id: 2 },
   deviation_reference: { id: 10 },
   risk_reference: { id: 11 },
@@ -73,6 +73,10 @@ describe("SystemHealthDashboard", () => {
     expect(screen.getByRole("link", { name: /Open matching root-cause evidence/ })).toHaveAttribute("href", "#/root-cause-analysis?windowId=501");
     expect(screen.getByRole("link", { name: /Open alert MEM-001/ })).toHaveAttribute("href", "#/predictive-alerts?alertId=88");
     expect(screen.getByText(/not a future-failure guarantee/i)).toBeVisible();
+    expect(screen.getByText(/operational risk-evidence RAM pressure/i)).toBeVisible();
+    expect(screen.getByText(/Review personal-baseline top memory processes/i)).toBeVisible();
+    expect(screen.getByText(/Advanced System Signal is not a future reliability guarantee/i)).toBeVisible();
+    expect(screen.queryByText(/Phase 3A|Phase 3B|Phase 7B/i)).not.toBeInTheDocument();
   });
 
   it("keeps not-evaluated scores neutral and never presents a fake zero", () => {

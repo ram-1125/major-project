@@ -324,8 +324,9 @@ Browser display preferences still use validated
   or change Windows configuration automatically.
 - Preserve the established primary menu order: Overview, Live Monitoring,
   Predictive Alerts, Root-Cause Analysis, System Health, PC Quality Check, then
-  optional Research & Validation. Keep Settings as a separated utility item at
-  the bottom. Notification preferences and other genuine application-level
+  optional Technical Evidence and Research & Validation. Technical Evidence is
+  read-only and bounded; Audit Records remain in Settings. Keep Settings as a
+  separated utility item at the bottom. Notification preferences and other genuine application-level
   settings belong only in Settings; alert filters and lifecycle actions remain
   on Predictive Alerts. Manual incident and feedback forms belong only in
   Research & Validation and remain collapsed by default.

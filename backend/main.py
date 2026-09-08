@@ -146,6 +146,11 @@ from backend.phase7a_repository import (
     update_notification_preferences,
 )
 from backend.phase7a_schemas import NotificationPreferencesUpdate
+from backend.process_attribution import process_attribution_for_window
+from backend.technical_evidence_repository import (
+    catalogue as technical_evidence_catalogue,
+    list_technical_evidence,
+)
 from backend.enhanced_repository import (
     get_enhanced_events,
     get_enhanced_status,
@@ -153,9 +158,10 @@ from backend.enhanced_repository import (
     get_signal_history,
 )
 from backend.postcalibration_repository import (
-    append_outcome,
+    append_alert_outcome,
     get_pipeline_status,
     list_validations,
+    preliminary_user_reviewed_precision,
 )
 
 
@@ -1222,23 +1228,27 @@ def create_app(
         with database_connection(request.app.state.database_path) as connection:
             items = get_root_causes_for_window(connection, window_id)
             risk_item = get_risk_for_window(connection, window_id)
+            process_attribution = process_attribution_for_window(connection, window_id)
         if items:
             return {
                 "status": "evaluated",
                 "feature_window_id": window_id,
                 "candidates": items,
+                "process_attribution": process_attribution,
             }
         if risk_item:
             return {
                 "status": "evaluated",
                 "feature_window_id": window_id,
                 "candidates": [],
+                "process_attribution": process_attribution,
             }
         status = risk_status(request.app.state.database_path)
         return {
             "status": "not_evaluated",
             "feature_window_id": window_id,
             "candidates": [],
+            "process_attribution": process_attribution,
             "reason_code": status["reason_code"],
             "baseline_state": status["baseline_state"],
         }
@@ -1280,7 +1290,7 @@ def create_app(
         summary: bool = False,
         start: datetime | None = None,
         end: datetime | None = None,
-        sort: Literal["oldest", "newest"] = "newest",
+        sort: Literal["oldest", "newest", "severity"] = "newest",
         device: str | None = None,
         category: Literal[
             "resource_pressure", "memory_and_swap_pressure",
@@ -1296,12 +1306,15 @@ def create_app(
             "open", "acknowledged", "recovering", "resolved"
         ] | None = None,
         workload: str | None = None,
+        search: str | None = Query(default=None, max_length=200),
+        view: Literal["attention", "observations", "all"] = "all",
     ) -> dict[str, object]:
         start_utc, end_utc = _validated_range(start, end)
         with database_connection(request.app.state.database_path) as connection:
             items, total = get_alerts(
                 connection, limit, offset, start_utc, end_utc, sort, device,
-                category, severity, state, workload, full=not summary,
+                category, severity, state, workload, search, view,
+                full=not summary,
             )
         return {
             "items": items,
@@ -1325,12 +1338,14 @@ def create_app(
         severity: str | None = None,
         state: str | None = None,
         workload: str | None = None,
+        search: str | None = Query(default=None, max_length=200),
+        view: Literal["attention", "observations", "all"] = "all",
     ) -> dict[str, int]:
         start_utc, end_utc = _validated_range(start, end)
         with database_connection(request.app.state.database_path) as connection:
             _, total = get_alerts(
                 connection, 1, 0, start_utc, end_utc, "newest", device,
-                category, severity, state, workload, full=False,
+                category, severity, state, workload, search, view, full=False,
             )
         return {"count": total}
 
@@ -1353,30 +1368,30 @@ def create_app(
     ) -> dict[str, object]:
         """Append a label for academic validation without changing analytics."""
         def persist(connection):
-            occurrence = connection.execute(
-                """SELECT id FROM alert_occurrences WHERE alert_id=?
-                ORDER BY observed_at_utc DESC,id DESC LIMIT 1""",
-                (alert_id,),
-            ).fetchone()
-            if occurrence is None:
-                raise ValueError("The alert has no occurrence to label.")
-            return append_outcome(
+            outcome = append_alert_outcome(
                 connection,
-                int(occurrence["id"]),
+                alert_id,
                 update.outcome,
                 note=update.note,
                 reason="user_supplied_academic_validation_label",
             )
+            return outcome, preliminary_user_reviewed_precision(connection)
         try:
-            result = run_write_transaction(
+            result, review_summary = run_write_transaction(
                 request.app.state.database_path, persist, priority="api"
             )
         except ValueError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
         return {
             "outcome": result,
+            "user_reviewed_summary": review_summary,
             "effect": "label_only_no_retraining_or_scoring_change",
         }
+
+    @local_app.get("/api/validation/user-reviewed-summary")
+    def user_reviewed_validation_summary(request: Request) -> dict[str, object]:
+        with database_connection(request.app.state.database_path) as connection:
+            return preliminary_user_reviewed_precision(connection)
 
     @local_app.get("/api/notifications/status")
     def notifications_status(request: Request) -> dict[str, object]:
@@ -1410,6 +1425,41 @@ def create_app(
                 "notification; it does not prove that a person saw it."
             ),
             "interpretation": ALERT_INTERPRETATION,
+        }
+
+    @local_app.get("/api/technical-evidence")
+    def technical_evidence_index() -> dict[str, object]:
+        return {
+            "datasets": technical_evidence_catalogue(),
+            "read_only": True,
+            "audit_records_location": "settings",
+        }
+
+    @local_app.get("/api/technical-evidence/{dataset}")
+    def technical_evidence_records(
+        request: Request,
+        dataset: Literal[
+            "monitoring", "monitoring-processes", "advanced-signals", "windows-events",
+            "alerts", "alert-evidence", "alert-transitions", "notification-deliveries",
+            "root-causes", "root-cause-evidence", "system-health", "health-components",
+            "health-deductions", "pc-quality", "pc-quality-contributions",
+            "personal-baseline", "baseline-membership", "analytical-records",
+        ],
+        limit: int = Query(default=25, ge=1, le=100),
+        offset: int = Query(default=0, ge=0),
+        search: str | None = Query(default=None, max_length=200),
+        context_id: int | None = Query(default=None, ge=1),
+        sort: Literal["oldest", "newest"] = "newest",
+    ) -> dict[str, object]:
+        with database_connection(request.app.state.database_path) as connection:
+            items, total = list_technical_evidence(
+                connection, dataset, limit=limit, offset=offset,
+                search=search, sort=sort, context_id=context_id,
+            )
+        return {
+            "dataset": dataset, "items": items, "total": total,
+            "limit": limit, "offset": offset, "sort": sort,
+            "read_only": True,
         }
 
     @local_app.put("/api/notifications/preferences")

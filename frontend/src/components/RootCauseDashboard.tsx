@@ -154,6 +154,27 @@ type DetailState = {
     health_band: string;
     evaluation_state: string;
   } | null;
+  processAttribution: {
+    state: string;
+    reason: string;
+    resource?: string;
+    attribution?: string;
+    window_start_utc?: string;
+    window_end_utc?: string;
+    primary_contributor?: {
+      process_name: string;
+      median_value: number;
+      maximum_value: number;
+      unit: string;
+      median_bytes: number | null;
+      maximum_bytes: number | null;
+      sample_count: number;
+      coverage_ratio: number | null;
+      foreground_sample_count: number;
+    } | null;
+    contributors?: Array<{ process_name: string; median_value: number; maximum_value: number; unit: string; coverage_ratio: number | null }>;
+    limitation?: string;
+  };
 };
 
 type Props = {
@@ -198,6 +219,42 @@ function evidenceValue(value: unknown): string {
       .join(" · ");
   }
   return String(value);
+}
+
+function alertSeverity(value: string): string {
+  return ({ informational: "Low", advisory: "Elevated", warning: "High", urgent: "Critical Evidence" } as Record<string, string>)[value] ?? label(value);
+}
+
+function userText(value: string): string {
+  return value
+    .replace(/Phase 3A/gi, "personal-baseline")
+    .replace(/Phase 3B/gi, "operational risk-evidence")
+    .replace(/Phase 7B(?:\.1)?/gi, "Advanced System Signal");
+}
+
+function featureValue(feature: string, value: number | null): string {
+  if (value === null) return "Unavailable";
+  if (feature.includes("bytes_per_second")) return `${(value / 1024 ** 2).toFixed(1)} MB/s`;
+  if (feature.includes("bytes")) return `${(value / 1024 ** 3).toFixed(1)} GB`;
+  if (feature.includes("percent") || feature.includes("ratio")) return `${value.toFixed(1)}%`;
+  if (feature.includes("seconds")) return `${value.toFixed(1)} s`;
+  return value.toFixed(2);
+}
+
+function differenceValue(feature: string, observed: number | null, centre: number | null): string {
+  if (observed === null || centre === null) return "Unavailable";
+  const difference = observed - centre;
+  const prefix = difference >= 0 ? "+" : "";
+  if (feature.includes("bytes_per_second")) return `${prefix}${(difference / 1024 ** 2).toFixed(1)} MB/s`;
+  if (feature.includes("bytes")) return `${prefix}${(difference / 1024 ** 3).toFixed(1)} GB`;
+  if (feature.includes("percent") || feature.includes("ratio")) return `${prefix}${difference.toFixed(1)} percentage points`;
+  if (feature.includes("seconds")) return `${prefix}${difference.toFixed(1)} s`;
+  return `${prefix}${difference.toFixed(2)}`;
+}
+
+function processValue(value: number, unit: string, bytes: number | null): string {
+  if (bytes !== null && bytes >= 0) return `${(bytes / 1024 ** 3).toFixed(1)} GB (${value.toFixed(1)}%)`;
+  return `${value.toFixed(1)} ${unit.startsWith("%") ? unit : `% · ${unit}`}`;
 }
 
 function severityTone(value: string): string {
@@ -350,7 +407,7 @@ export function RootCauseDashboard({
         `${apiBaseUrl}/api/risk/${expandedWindowId}`,
         controller.signal,
       ),
-      fetchDetail<{ status: string; candidates: Candidate[] }>(
+      fetchDetail<{ status: string; candidates: Candidate[]; process_attribution: DetailState["processAttribution"] }>(
         `${apiBaseUrl}/api/root-causes/${expandedWindowId}`,
         controller.signal,
       ),
@@ -373,6 +430,7 @@ export function RootCauseDashboard({
         alert: alertResponse?.alert ?? null,
         deviation: deviationResponse.assessment,
         health: healthResponse.assessment,
+        processAttribution: rootResponse.process_attribution ?? { state: "unavailable", reason: "legacy_api_response_without_process_attribution" },
       });
       setDetailState("ready");
     }).catch((error: unknown) => {
@@ -419,7 +477,7 @@ export function RootCauseDashboard({
           <label><span>Time range</span><select value={range} onChange={(event) => onRangeChange(event.target.value as Props["range"])}>{RANGE_LABELS.map(([value, text]) => <option value={value} key={value}>{text}</option>)}</select></label>
           <label><span>Workload</span><select value={workload} onChange={(event) => onWorkloadChange(event.target.value)}><option value="all">All workloads</option>{workloads.map((value) => <option value={value} key={value}>{label(value)}</option>)}</select></label>
           <label><span>Alert category</span><select value={category} onChange={(event) => setCategory(event.target.value)}><option value="all">All categories</option>{categories.map((value) => <option value={value} key={value}>{label(value)}</option>)}</select></label>
-          <label><span>Alert severity</span><select value={severity} onChange={(event) => setSeverity(event.target.value)}><option value="all">All severities</option>{["informational", "advisory", "warning", "urgent"].map((value) => <option value={value} key={value}>{label(value)}</option>)}</select></label>
+          <label><span>Alert severity</span><select value={severity} onChange={(event) => setSeverity(event.target.value)}><option value="all">All severities</option>{["informational", "advisory", "warning", "urgent"].map((value) => <option value={value} key={value}>{alertSeverity(value)}</option>)}</select></label>
           <label><span>Contributor</span><select value={candidateDomain} onChange={(event) => setCandidateDomain(event.target.value)}><option value="all">All contributors</option>{domains.map((value) => <option value={value} key={value}>{label(value)}</option>)}</select></label>
           <label><span>Evaluation state</span><select value={evaluationState} onChange={(event) => setEvaluationState(event.target.value)}><option value="all">All evaluated</option><option value="with_alert">Related alert available</option><option value="without_alert">No related alert</option></select></label>
           <label><span>Sort</span><select value={sort} onChange={(event) => setSort(event.target.value as typeof sort)}><option value="newest">Newest first</option><option value="oldest">Oldest first</option><option value="evidence">Strongest evidence first</option></select></label>
@@ -447,7 +505,7 @@ export function RootCauseDashboard({
                 <div className="investigation-summary">
                   <div className={`investigation-icon investigation-icon--${severityTone(relatedAlert?.current_severity ?? item.evidence_level)}`} aria-hidden="true"><Workflow /></div>
                   <div className="investigation-primary">
-                    <span>Investigation #{item.id} · window #{item.feature_window_id}</span>
+                    <span>Analysis period ending {formatTimestamp(item.window_end_utc)}</span>
                     <h4>{relatedAlert ? relatedAlert.title : `${label(item.evidence_level)} operational evidence`}</h4>
                     <p>{topCandidate ? `Highest-ranked possible contributor: ${label(topCandidate.candidate_domain)}` : "No evidence-supported contributor was stored."}</p>
                   </div>
@@ -480,19 +538,25 @@ export function RootCauseDashboard({
 }
 
 function InvestigationDetails({ detail, formatTimestamp }: { detail: DetailState; formatTimestamp: (value: string) => string }) {
-  const { risk, candidates, alert, deviation, health } = detail;
+  const { risk, candidates, alert, deviation, health, processAttribution } = detail;
   const events = risk.components.flatMap((component) => component.evidence.events ?? []);
   const timeline = [
     { time: risk.window_start_utc, text: "Evidence window opened" },
     { time: risk.window_end_utc, text: "Evidence window completed" },
     { time: risk.evaluated_at_utc, text: "Risk evidence evaluated" },
     ...(alert ? [
-      { time: alert.first_observed_utc, text: `${alert.alert_code} first observed` },
-      { time: alert.latest_observed_utc, text: `${alert.alert_code} most recently observed` },
+      { time: alert.first_observed_utc, text: "Related alert first observed" },
+      { time: alert.latest_observed_utc, text: "Related alert most recently observed" },
     ] : []),
     ...events.map((event) => ({ time: event.event_timestamp_utc, text: `${label(event.smartops_category)} event (${event.timing})` })),
   ].filter((entry, index, rows) => rows.findIndex((item) => item.time === entry.time && item.text === entry.text) === index)
     .sort((left, right) => Date.parse(left.time) - Date.parse(right.time));
+  const supportingEvidence = [...new Map(candidates.flatMap((candidate) => [
+    ...candidate.supporting_metrics,
+    ...candidate.supporting_events,
+  ]).map((evidence) => [`${evidence.evidence_kind}:${evidence.evidence_key}:${evidence.reason_code}`, evidence])).values()];
+  const contradictingEvidence = [...new Map(candidates.flatMap((candidate) => candidate.contradictory_evidence)
+    .map((evidence) => [`${evidence.evidence_kind}:${evidence.evidence_key}:${evidence.reason_code}`, evidence])).values()];
 
   return (
     <div className="investigation-workspace">
@@ -500,8 +564,16 @@ function InvestigationDetails({ detail, formatTimestamp }: { detail: DetailState
         <article><span>Observed condition</span><strong>Risk Evidence {risk.risk_evidence_index.toFixed(1)} · {label(risk.evidence_level)}</strong><p>{label(risk.temporal_pattern)} across {risk.persistence_window_count} completed window(s).</p></article>
         <article><span>Evidence period</span><strong>{formatTimestamp(risk.window_start_utc)}</strong><p>to {formatTimestamp(risk.window_end_utc)} · quality {label(risk.data_quality_status)}</p></article>
         <article><span>Workload context</span><strong>{label(risk.workload_context)}</strong><p>{(risk.workload_confidence * 100).toFixed(0)}% stored workload confidence.</p></article>
-        <article><span>Related states</span><strong>{health ? `${label(health.health_band)} health` : alert ? `${label(alert.state)} alert` : "No linked health or alert"}</strong><p>{health ? `${label(health.evaluation_state)} · score ${health.system_health_score?.toFixed(1) ?? "unavailable"}` : alert ? `${label(alert.current_severity)} · ${alert.alert_code}` : "The analysis remains available without fabricating a relationship."}</p></article>
+        <article><span>Related states</span><strong>{health ? `${label(health.health_band)} health` : alert ? `${label(alert.state)} alert` : "No linked health or alert"}</strong><p>{health ? `${label(health.evaluation_state)} · score ${health.system_health_score?.toFixed(1) ?? "unavailable"}` : alert ? `${alertSeverity(alert.current_severity)} · ${alert.title}` : "The analysis remains available without fabricating a relationship."}</p></article>
       </div>
+
+      <section className="investigation-section application-attribution">
+        <div className="investigation-section-heading"><div><p className="eyebrow">Timestamp-matched process evidence</p><h5>Application contribution</h5></div><span>{label(processAttribution.attribution ?? processAttribution.state)}</span></div>
+        {processAttribution.state === "evaluated" && processAttribution.primary_contributor ? <>
+          <p><strong>{processAttribution.primary_contributor.process_name}</strong> was the largest recorded {label(processAttribution.resource)} consumer in this exact analysis period, with a median of {processValue(processAttribution.primary_contributor.median_value, processAttribution.primary_contributor.unit, processAttribution.primary_contributor.median_bytes)} and a recorded maximum of {processValue(processAttribution.primary_contributor.maximum_value, processAttribution.primary_contributor.unit, processAttribution.primary_contributor.maximum_bytes)}.</p>
+          <p>{label(processAttribution.attribution)}. It appeared in {processAttribution.primary_contributor.sample_count} timestamp-matched process snapshot(s){processAttribution.primary_contributor.foreground_sample_count > 0 ? ` and was foreground in ${processAttribution.primary_contributor.foreground_sample_count}` : ""}. Foreground activity alone is not treated as proof of causation.</p>
+        </> : processAttribution.state === "evaluated" ? <p>No single dominant application was identified; several recorded contributors had similar use during this period.</p> : <p>Process attribution is unavailable for this period: {label(processAttribution.reason)}. SmartOps did not substitute process data from another window.</p>}
+      </section>
 
       <section className="investigation-section">
         <div className="investigation-section-heading"><div><p className="eyebrow">Ranked stored interpretation</p><h5>Likely contributing factors</h5></div><span>Evidence strength is not failure probability.</span></div>
@@ -511,7 +583,7 @@ function InvestigationDetails({ detail, formatTimestamp }: { detail: DetailState
               const confidence = Math.max(0, Math.min(100, candidate.evidence_confidence * 100));
               return <article key={candidate.id}>
                 <div className="contributor-rank" title={`Rank ${candidate.rank}`}><ContributorIcon domain={candidate.candidate_domain} /><span>{candidate.rank}</span></div>
-                <div className="contributor-content"><div><strong>{label(candidate.candidate_domain)}</strong><span>{candidate.explanation}</span></div><div className="contributor-bar" role="meter" aria-label={`${label(candidate.candidate_domain)} evidence support`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(confidence)}><i style={{ width: `${confidence}%` }} /></div><small>{confidence.toFixed(0)}% stored evidence support</small></div>
+                <div className="contributor-content"><div><strong>{label(candidate.candidate_domain)}</strong><span>{userText(candidate.explanation)}</span></div><div className="contributor-bar" role="meter" aria-label={`${label(candidate.candidate_domain)} evidence support`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(confidence)}><i style={{ width: `${confidence}%` }} /></div><small>{confidence.toFixed(0)}% stored evidence support</small></div>
               </article>;
             })}
           </div>
@@ -519,29 +591,28 @@ function InvestigationDetails({ detail, formatTimestamp }: { detail: DetailState
       </section>
 
       <section className="investigation-section">
-        <div className="investigation-section-heading"><div><p className="eyebrow">Personal-baseline comparison</p><h5>Observed values and expected ranges</h5></div><span>{deviation ? `Deviation assessment #${deviation.id}` : "Baseline comparison unavailable"}</span></div>
-        {deviation?.feature_results.length ? <div className="table-wrap"><table><thead><tr><th>Metric</th><th>Observed</th><th>Baseline centre</th><th>Expected range</th><th>Difference</th><th>Stored interpretation</th></tr></thead><tbody>{deviation.feature_results.filter((result) => result.severity_band !== "not_evaluated").slice(0, 12).map((result) => <tr key={result.feature_name}><td>{label(result.feature_name)}</td><td>{result.observed_value === null ? "Unavailable" : result.observed_value.toFixed(2)}</td><td>{result.baseline_centre === null ? "Unavailable" : result.baseline_centre.toFixed(2)}</td><td>{result.expected_low === null || result.expected_high === null ? "Unavailable" : `${result.expected_low.toFixed(2)} – ${result.expected_high.toFixed(2)}`}</td><td>{result.observed_value === null || result.baseline_centre === null ? "Unavailable" : `${result.observed_value - result.baseline_centre >= 0 ? "+" : ""}${(result.observed_value - result.baseline_centre).toFixed(2)}`}</td><td>{label(result.reason_code)}</td></tr>)}</tbody></table></div> : <div className="analysis-empty analysis-empty--compact"><Info aria-hidden="true" /><strong>Personal-baseline comparison unavailable</strong><p>No stored deviation feature results were returned for this window. Values are not inferred from another period.</p></div>}
+        <div className="investigation-section-heading"><div><p className="eyebrow">Personal-baseline comparison</p><h5>Observed values and expected ranges</h5></div><span>{deviation ? `Baseline v${risk.baseline_version_id ?? "legacy"} | ${label(risk.data_quality_status)}` : "Baseline comparison unavailable"}</span></div>
+        {deviation?.feature_results.length ? <><p className="analysis-context-note">{label(risk.workload_context)} workload | {formatTimestamp(risk.window_start_utc)} to {formatTimestamp(risk.window_end_utc)}. Values are rounded for readability; exact stored values remain in Technical Evidence.</p><div className="table-wrap"><table><thead><tr><th>Metric</th><th>Observed</th><th>Baseline centre</th><th>Expected range</th><th>Difference</th><th>Stored interpretation</th></tr></thead><tbody>{deviation.feature_results.filter((result) => result.severity_band !== "not_evaluated").slice(0, 12).map((result) => <tr key={result.feature_name}><td>{label(result.feature_name)}</td><td>{featureValue(result.feature_name, result.observed_value)}</td><td>{featureValue(result.feature_name, result.baseline_centre)}</td><td>{result.expected_low === null || result.expected_high === null ? "Unavailable" : `${featureValue(result.feature_name, result.expected_low)} to ${featureValue(result.feature_name, result.expected_high)}`}</td><td>{differenceValue(result.feature_name, result.observed_value, result.baseline_centre)}</td><td>{label(result.reason_code)}</td></tr>)}</tbody></table></div></> : <div className="analysis-empty analysis-empty--compact"><Info aria-hidden="true" /><strong>Personal-baseline comparison unavailable</strong><p>No comparable stored baseline indicators were returned for this exact workload and period. Values are not inferred from another workload or time range.</p></div>}
       </section>
 
       <div className="investigation-columns">
-        <section className="investigation-section"><h5>Supporting and contradicting evidence</h5>{candidates.length ? candidates.map((candidate) => <div className="candidate-evidence" key={candidate.id}><strong>{label(candidate.candidate_domain)}</strong><ul>{candidate.supporting_metrics.map((evidence, index) => <li key={`support-${candidate.id}-${index}`}><CheckCircle2 aria-hidden="true" /><span><b>{label(evidence.evidence_key)}</b>: {evidenceValue(evidence.observed_value)} · {label(evidence.reason_code)}</span></li>)}{candidate.supporting_events.map((evidence, index) => <li key={`event-${candidate.id}-${index}`}><AlertTriangle aria-hidden="true" /><span>{label(evidence.reason_code)}</span></li>)}{candidate.contradictory_evidence.map((evidence, index) => <li className="evidence-healthy" key={`contradict-${candidate.id}-${index}`}><ShieldCheck aria-hidden="true" /><span>{label(evidence.reason_code)} · {evidenceValue(evidence.observed_value)}</span></li>)}</ul></div>) : <p>No candidate evidence is stored.</p>}</section>
-        <section className="investigation-section"><h5>Stored evidence relationships</h5><div className="relationship-map" aria-label="Stored evidence relationship diagram"><div>Observed telemetry</div>{deviation && <><span aria-hidden="true">→</span><div>Baseline deviation</div></>}<span aria-hidden="true">→</span><div>Ranked hypotheses</div>{health && <><span aria-hidden="true">→</span><div>Related health</div></>}{alert && <><span aria-hidden="true">→</span><div>Related alert</div></>}</div><p>These are stored associations from the evaluated feature window. They support investigation but do not establish causality.</p><dl className="evidence-component-list">{risk.components.filter((component) => component.contribution > 0).map((component) => <div key={component.id}><dt>{label(component.correlation_group || component.component_name)}</dt><dd>+{component.contribution.toFixed(2)} · {label(component.reason_code)}</dd></div>)}</dl></section>
+        <section className="investigation-section"><h5>Supporting and contradicting evidence</h5>{supportingEvidence.length ? <p><CheckCircle2 aria-hidden="true" /> <strong>Supporting:</strong> {label(supportingEvidence[0].evidence_key)} was recorded as {evidenceValue(supportingEvidence[0].observed_value)} ({label(supportingEvidence[0].reason_code)}).</p> : <p>No supporting signal was stored for this investigation.</p>}{contradictingEvidence.length ? <p><ShieldCheck aria-hidden="true" /> <strong>Contradicting or healthy:</strong> {label(contradictingEvidence[0].evidence_key)} was recorded as {evidenceValue(contradictingEvidence[0].observed_value)} ({label(contradictingEvidence[0].reason_code)}).</p> : <p>No separate contradicting signal was stored.</p>}</section>
+        <section className="investigation-section"><h5>Complete evidence relationships</h5><p>Exact component contributions, correlation decisions, raw stored values and version identifiers are available in the matching read-only technical record.</p><a href={`#/technical-evidence?dataset=root-causes&contextId=${risk.id}`}>View exact Technical Evidence for this analysis period</a></section>
       </div>
 
       <section className="investigation-section"><h5>Temporal sequence</h5><ol className="evidence-timeline">{timeline.map((entry, index) => <li key={`${entry.time}-${entry.text}-${index}`}><i aria-hidden="true" /><div><strong>{entry.text}</strong><time dateTime={entry.time}>{formatTimestamp(entry.time)}</time></div></li>)}</ol></section>
 
       <div className="investigation-columns">
-        <section className="investigation-section"><h5>Missing evidence and limitations</h5>{alert?.excluded_inputs.length ? <ul>{alert.excluded_inputs.map((input) => <li key={`${input.input}-${input.status}`}><strong>{label(input.input)}</strong>: {label(input.status)}{input.reason ? ` · ${label(input.reason)}` : ""}</li>)}</ul> : <p>No alert-specific excluded input was recorded.</p>}{candidates.flatMap((candidate) => candidate.limitations).length ? <ul>{[...new Set(candidates.flatMap((candidate) => candidate.limitations))].map((limitation) => <li key={limitation}>{limitation}</li>)}</ul> : <p>Telemetry correlation cannot prove causality.</p>}</section>
-        <section className="investigation-section"><h5>Safe diagnostic checks</h5>{candidates.flatMap((candidate) => candidate.recommended_verification_steps).length ? <ol>{[...new Set(candidates.flatMap((candidate) => candidate.recommended_verification_steps))].map((step) => <li key={step}>{step}</li>)}</ol> : alert?.diagnostic_recommendations.length ? <ol>{alert.diagnostic_recommendations.map((step) => <li key={step}>{step}</li>)}</ol> : <p>No diagnostic check was stored for this window.</p>}</section>
+        <section className="investigation-section"><h5>Missing evidence and limitations</h5>{alert?.excluded_inputs.length ? <ul>{alert.excluded_inputs.map((input) => <li key={`${input.input}-${input.status}`}><strong>{label(input.input)}</strong>: {label(input.status)}{input.reason ? ` · ${label(input.reason)}` : ""}</li>)}</ul> : <p>No alert-specific excluded input was recorded.</p>}{candidates.flatMap((candidate) => candidate.limitations).length ? <ul>{[...new Set(candidates.flatMap((candidate) => candidate.limitations).map(userText))].map((limitation) => <li key={limitation}>{limitation}</li>)}</ul> : <p>Telemetry correlation cannot prove causality.</p>}</section>
+        <section className="investigation-section"><h5>Safe diagnostic checks</h5>{candidates.flatMap((candidate) => candidate.recommended_verification_steps).length ? <ol>{[...new Set(candidates.flatMap((candidate) => candidate.recommended_verification_steps).map(userText))].map((step) => <li key={step}>{step}</li>)}</ol> : alert?.diagnostic_recommendations.length ? <ol>{alert.diagnostic_recommendations.map(userText).map((step) => <li key={step}>{step}</li>)}</ol> : <p>No diagnostic check was stored for this window.</p>}</section>
       </div>
 
       <nav className="analysis-related-links" aria-label="Related SmartOps records">
         <a href={`#/system-health?windowId=${risk.feature_window_id}`}><Gauge aria-hidden="true" />Open matching System Health record<ExternalLink aria-hidden="true" /></a>
-        {alert && <a href={`#/predictive-alerts?alertId=${alert.id}`}><AlertTriangle aria-hidden="true" />Open alert {alert.alert_code}<ExternalLink aria-hidden="true" /></a>}
+        {alert && <a href={`#/predictive-alerts?alertId=${alert.id}`}><AlertTriangle aria-hidden="true" />Open related alert<ExternalLink aria-hidden="true" /></a>}
         <a href={`#/live-monitoring?start=${encodeURIComponent(risk.window_start_utc)}&end=${encodeURIComponent(risk.window_end_utc)}`}><Activity aria-hidden="true" />Inspect Live Monitoring period<ExternalLink aria-hidden="true" /></a>
       </nav>
 
-      <details className="technical-record-details"><summary>Technical record identifiers and versions</summary><dl><div><dt>Risk assessment</dt><dd>#{risk.id}</dd></div><div><dt>Feature window</dt><dd>#{risk.feature_window_id}</dd></div><div><dt>Algorithm</dt><dd>{risk.algorithm_version ?? "Unavailable"}</dd></div><div><dt>Configuration</dt><dd>{risk.configuration_version ?? "Unavailable"}</dd></div><div><dt>Catalogue</dt><dd>{risk.catalogue_version ?? "Unavailable"}</dd></div><div><dt>Baseline version</dt><dd>{risk.baseline_version_id ?? "Unavailable"}</dd></div><div><dt>Workload rule</dt><dd>{risk.workload_rule_version ?? "Unavailable"}</dd></div></dl></details>
     </div>
   );
 }

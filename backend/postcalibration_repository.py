@@ -678,6 +678,21 @@ def latest_outcome(
     return dict(row) if row else None
 
 
+def latest_outcome_for_alert(
+    connection: sqlite3.Connection, alert_id: int
+) -> dict[str, Any] | None:
+    """Return the latest append-only outcome across an alert lifecycle."""
+    row = connection.execute(
+        """SELECT outcome.* FROM alert_outcome_events outcome
+        JOIN alert_occurrences occurrence
+          ON occurrence.id = outcome.alert_occurrence_id
+        WHERE occurrence.alert_id = ?
+        ORDER BY outcome.event_timestamp_utc DESC, outcome.id DESC LIMIT 1""",
+        (alert_id,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
 def append_outcome(
     connection: sqlite3.Connection,
     occurrence_id: int,
@@ -719,4 +734,117 @@ def append_outcome(
         "optional_note": note,
         "audit_reason": reason,
         "changed": True,
+    }
+
+
+def append_alert_outcome(
+    connection: sqlite3.Connection,
+    alert_id: int,
+    new_outcome: str,
+    *,
+    note: str | None,
+    reason: str,
+) -> dict[str, Any]:
+    """Idempotently append the canonical user outcome for one alert.
+
+    The event is attached to the latest material occurrence, while the
+    previous state is resolved across the complete lifecycle. This keeps quick
+    review simple without deleting or rewriting older outcome events.
+    """
+    if new_outcome not in {"pending", "confirmed", "false_positive", "inconclusive"}:
+        raise ValueError("Unsupported alert outcome.")
+    occurrence = connection.execute(
+        """SELECT id FROM alert_occurrences WHERE alert_id = ?
+        ORDER BY condition_met DESC, observed_at_utc DESC, id DESC LIMIT 1""",
+        (alert_id,),
+    ).fetchone()
+    if occurrence is None:
+        raise ValueError("The alert has no occurrence to label.")
+    previous = latest_outcome_for_alert(connection, alert_id)
+    if previous and previous["new_outcome"] == new_outcome and (
+        previous.get("optional_note") or None
+    ) == (note or None):
+        return {**previous, "changed": False}
+    timestamp = _now()
+    cursor = connection.execute(
+        """INSERT INTO alert_outcome_events (
+        alert_occurrence_id, previous_outcome, new_outcome,
+        event_timestamp_utc, optional_note, audit_reason, created_at_utc
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            occurrence["id"], previous["new_outcome"] if previous else None,
+            new_outcome, timestamp, note, reason, timestamp,
+        ),
+    )
+    return {
+        "id": int(cursor.lastrowid),
+        "alert_occurrence_id": int(occurrence["id"]),
+        "previous_outcome": previous["new_outcome"] if previous else None,
+        "new_outcome": new_outcome,
+        "event_timestamp_utc": timestamp,
+        "optional_note": note,
+        "audit_reason": reason,
+        "changed": True,
+    }
+
+
+def preliminary_user_reviewed_precision(
+    connection: sqlite3.Connection,
+) -> dict[str, Any]:
+    """Summarize the latest canonical review per alert.
+
+    This is alert-level user review, not full model accuracy. Pending and
+    inconclusive reviews are disclosed but excluded from the denominator.
+    """
+    rows = connection.execute(
+        """WITH ranked AS (
+          SELECT occurrence.alert_id, outcome.new_outcome,
+                 outcome.event_timestamp_utc,
+                 ROW_NUMBER() OVER (
+                   PARTITION BY occurrence.alert_id
+                   ORDER BY outcome.event_timestamp_utc DESC, outcome.id DESC
+                 ) AS position
+          FROM alert_outcome_events outcome
+          JOIN alert_occurrences occurrence
+            ON occurrence.id = outcome.alert_occurrence_id
+        )
+        SELECT new_outcome, COUNT(*) count,
+               MAX(event_timestamp_utc) last_updated_utc
+        FROM ranked WHERE position = 1 GROUP BY new_outcome"""
+    ).fetchall()
+    counts = {str(row["new_outcome"]): int(row["count"]) for row in rows}
+    last_updated = max(
+        (str(row["last_updated_utc"]) for row in rows if row["last_updated_utc"]),
+        default=None,
+    )
+    confirmed = counts.get("confirmed", 0)
+    false_positive = counts.get("false_positive", 0)
+    decisive = confirmed + false_positive
+    total_labelled = sum(counts.values())
+    total_alerts = int(connection.execute("SELECT COUNT(*) FROM alerts").fetchone()[0])
+    inconclusive = counts.get("inconclusive", 0)
+    pending = counts.get("pending", 0)
+    unreviewed = max(0, total_alerts - total_labelled)
+    return {
+        "status": "evaluated" if decisive else "collecting_user_reviews",
+        "label": "Preliminary user-reviewed result",
+        "precision": confirmed / decisive if decisive else None,
+        "confirmed_count": confirmed,
+        "false_positive_count": false_positive,
+        "reviewed_alert_count": decisive,
+        "pending_count": pending,
+        "inconclusive_count": inconclusive,
+        "unreviewed_count": unreviewed,
+        "total_labelled_alert_count": total_labelled,
+        "dataset_size": total_alerts,
+        "review_coverage": decisive / total_alerts if total_alerts else None,
+        "last_updated_utc": last_updated,
+        "formula": "Confirmed / (Confirmed + False positive)",
+        "full_accuracy": None,
+        "full_accuracy_state": "insufficient_labeled_evidence",
+        "interpretation": (
+            "This preliminary alert-level user review is not full model accuracy. "
+            "Full accuracy additionally requires eligible true-negative and "
+            "false-negative observation windows."
+        ),
     }

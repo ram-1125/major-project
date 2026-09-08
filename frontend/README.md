@@ -124,7 +124,7 @@ and can be collapsed on desktop; that browser-only choice is validated in
 `localStorage`. At tablet/mobile widths it becomes an accessible drawer.
 
 Navigation Search is local application navigation, not personal-data search.
-It indexes the eight routes, Settings sections, major SmartOps features and
+It indexes the nine routes, Settings sections, major SmartOps features and
 the 30 stable PC Quality profile identifiers. Use the sidebar field, the top
 bar Search control, or `Ctrl+K` (`Cmd+K` on macOS-style keyboards). Arrow keys
 move through results, Enter opens one and Escape closes the dialog. Search
@@ -180,12 +180,19 @@ SmartOps will not inspect URLs, browser history, page titles, or content to
 distinguish it from general Browser/Media.
 
 Predictive Alerts shows a compact basis, evidence confidence,
-and method-validation state; its disclosure contains the immutable values,
-baseline, thresholds, confidence components, limitations, and append-only
-outcome controls. Legacy alerts are explicitly labelled and never fabricated.
+method-validation state, safe checks and simple append-only outcome controls.
+Exact immutable values, baselines, thresholds, lifecycle records and delivery
+history are available through the optional read-only **Technical Evidence**
+route. Legacy alerts are explicitly labelled and never fabricated.
 
 Advanced System Signals uses Available, Collecting history, Temporarily unavailable,
 Not applicable, Unsupported on this device, and Collector failure. Permanent
-unsupported items remain hidden by default; compact grouped reasons are
-available through **Show technical diagnostics**. Internally, these signals
+unsupported items remain hidden by default; provenance and collector
+diagnostics are available in Technical Evidence. Internally, these signals
 remain analytically isolated and do not change risk, health or alert results.
+
+Technical Evidence has seven audience-oriented tabs: Monitoring, Alerts, Root
+Causes, System Health, PC Quality, Personal Baseline and Analytical Records.
+Each uses bounded server pagination and local dataset search. It is read-only;
+Audit Records remain exclusively in Settings, and Research & Validation remains
+the home for outcome metrics, dataset sufficiency and academic methodology.

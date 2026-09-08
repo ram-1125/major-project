@@ -15,6 +15,7 @@ from analytics.alerts import (
 from analytics.health import evaluate_database as evaluate_health
 from backend.database import database_connection, initialize_database
 from backend.main import create_app
+from backend.phase5a_repository import get_alert
 
 
 DEVICE = "alert-test-device"
@@ -264,6 +265,75 @@ def test_future_alert_snapshot_confidence_validation_and_outcome_are_separate(
         ).fetchone()[0] == 1
 
 
+def test_resolved_alert_detail_uses_material_trigger_not_recovery(tmp_path: Path):
+    path = make_database(tmp_path)
+    prepare(path, [{"cpu": 96}, {"cpu": 97}])
+    evaluate_database(path)
+    with database_connection(path) as connection:
+        alert = connection.execute("SELECT * FROM alerts LIMIT 1").fetchone()
+        trigger = connection.execute(
+            "SELECT * FROM alert_occurrences WHERE alert_id=? AND condition_met=1 ORDER BY id DESC LIMIT 1",
+            (alert["id"],),
+        ).fetchone()
+        assert trigger is not None
+        recovery_source = connection.execute(
+            """SELECT window.id feature_window_id, health.id health_assessment_id
+            FROM feature_windows window JOIN health_assessments health
+              ON health.feature_window_id=window.id
+            WHERE window.id != ? ORDER BY window.id LIMIT 1""",
+            (trigger["feature_window_id"],),
+        ).fetchone()
+        recovery_time = (BASE + timedelta(hours=2)).isoformat()
+        with connection:
+            recovery_id = connection.execute(
+                """INSERT INTO alert_occurrences (
+                alert_id, feature_window_id, health_assessment_id,
+                risk_assessment_id, deviation_assessment_id, observed_at_utc,
+                severity, condition_met, raw_evidence_strength,
+                effective_evidence_strength, temporal_pattern, trend_direction,
+                evidence_signature, created_at_utc
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 'recovery', 'recovering', ?, ?)""",
+                (
+                    trigger["alert_id"], recovery_source["feature_window_id"],
+                    recovery_source["health_assessment_id"], trigger["risk_assessment_id"],
+                    trigger["deviation_assessment_id"], recovery_time,
+                    trigger["severity"], "recovery-test", recovery_time,
+                ),
+            ).lastrowid
+            connection.execute(
+                "UPDATE alerts SET state='resolved', resolved_at_utc=?, latest_observed_utc=? WHERE id=?",
+                (recovery_time, recovery_time, alert["id"]),
+            )
+        detail = get_alert(connection, int(alert["id"]))
+    assert detail is not None
+    assert detail["material_occurrence"]["id"] == trigger["id"]
+    assert detail["material_occurrence"]["id"] != recovery_id
+    assert any(item["id"] == recovery_id for item in detail["occurrences"])
+    assert detail["evidence"]
+
+
+def test_alert_outcome_revision_is_idempotent_and_updates_preliminary_precision(tmp_path: Path):
+    path = make_database(tmp_path)
+    prepare(path, [{"cpu": 96}, {"cpu": 97}])
+    evaluate_database(path)
+    with database_connection(path) as connection:
+        alert_id = int(connection.execute("SELECT id FROM alerts LIMIT 1").fetchone()[0])
+    with TestClient(create_app(path)) as client:
+        first = client.post(f"/api/alerts/{alert_id}/outcome", json={"outcome": "confirmed"})
+        duplicate = client.post(f"/api/alerts/{alert_id}/outcome", json={"outcome": "confirmed"})
+        revised = client.post(f"/api/alerts/{alert_id}/outcome", json={"outcome": "false_positive"})
+        summary = client.get("/api/validation/user-reviewed-summary").json()
+    assert first.json()["outcome"]["changed"] is True
+    assert duplicate.json()["outcome"]["changed"] is False
+    assert revised.json()["outcome"]["previous_outcome"] == "confirmed"
+    assert summary["confirmed_count"] == 0
+    assert summary["false_positive_count"] == 1
+    assert summary["precision"] == 0
+    assert summary["full_accuracy"] is None
+    with database_connection(path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM alert_outcome_events").fetchone()[0] == 2
+
+
 def test_high_confidence_workload_exception_and_low_confidence_conservatism(
     tmp_path: Path,
 ):
@@ -497,6 +567,35 @@ def test_api_filters_pagination_detail_acknowledgement_and_get_immutability(
     assert old_api.status_code == 200
 
 
+def test_alert_history_searches_beyond_first_fifty_and_filters_canonical_workload(tmp_path: Path):
+    path = make_database(tmp_path)
+    prepare(path, [{"ram": 96}, {"ram": 97}])
+    evaluate_database(path)
+    with database_connection(path) as connection, connection:
+        source = connection.execute("SELECT * FROM alerts LIMIT 1").fetchone()
+        columns = [row["name"] for row in connection.execute("PRAGMA table_info(alerts)") if row["name"] != "id"]
+        for index in range(60):
+            values = {column: source[column] for column in columns}
+            values.update({
+                "alert_fingerprint": f"history-search-{index}",
+                "alert_code": f"SEARCH-{index}",
+                "title": "Target Beyond Fifty" if index == 0 else f"Routine stored alert {index}",
+                "workload_context": "browser_or_media" if index == 0 else "interactive_light",
+            })
+            connection.execute(
+                f"INSERT INTO alerts ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})",
+                tuple(values[column] for column in columns),
+            )
+    with TestClient(create_app(path)) as client:
+        response = client.get("/api/alerts/history", params={
+            "limit": 25, "offset": 0, "summary": "true",
+            "search": "Target Beyond Fifty", "workload": "browser_or_media",
+        })
+    assert response.status_code == 200
+    assert response.json()["total"] == 1
+    assert response.json()["items"][0]["title"] == "Target Beyond Fifty"
+
+
 def test_every_severity_has_a_controlled_synthetic_path(tmp_path: Path):
     informational = make_database(tmp_path / "informational")
     prepare(
@@ -532,6 +631,18 @@ def test_every_severity_has_a_controlled_synthetic_path(tmp_path: Path):
                 for row in connection.execute("SELECT current_severity FROM alerts")
             )
     assert severities == {"informational", "advisory", "warning", "urgent"}
+
+    with TestClient(create_app(informational)) as client:
+        assert client.get(
+            "/api/alerts/history", params={"view": "attention", "summary": "true"}
+        ).json()["total"] == 0
+        assert client.get(
+            "/api/alerts/history", params={"view": "observations", "summary": "true"}
+        ).json()["total"] == 1
+    with TestClient(create_app(warning)) as client:
+        assert client.get(
+            "/api/alerts/history", params={"view": "attention", "summary": "true"}
+        ).json()["total"] == 1
 
 
 def test_failed_evaluation_rolls_back_alert_and_run(

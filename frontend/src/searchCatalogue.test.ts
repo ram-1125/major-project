@@ -4,7 +4,8 @@ import { NAVIGATION_SEARCH_CATALOGUE, PC_QUALITY_SEARCH_PROFILES, isStableQualit
 
 describe("local navigation search catalogue", () => {
   it("contains every page and all 30 stable PC Quality profile IDs", () => {
-    expect(NAVIGATION_SEARCH_CATALOGUE.filter((item) => item.group === "Pages" && item.id.startsWith("page-"))).toHaveLength(8);
+    expect(NAVIGATION_SEARCH_CATALOGUE.filter((item) => item.group === "Pages" && item.id.startsWith("page-"))).toHaveLength(9);
+    expect(searchNavigation("technical evidence")).toEqual(expect.arrayContaining([expect.objectContaining({ href: "#/technical-evidence" })]));
     expect(PC_QUALITY_SEARCH_PROFILES).toHaveLength(30);
     expect(new Set(PC_QUALITY_SEARCH_PROFILES.map(([id]) => id)).size).toBe(30);
   });

@@ -22,6 +22,7 @@ import { LiveMonitoringSummary } from "./components/LiveMonitoringSummary";
 import { AlertDetails } from "./components/AlertDetails";
 import { AlertLifecycleTimeline } from "./components/AlertLifecycleTimeline";
 import { RootCauseDashboard } from "./components/RootCauseDashboard";
+import { TechnicalEvidence } from "./components/TechnicalEvidence";
 import { SystemHealthDashboard } from "./components/SystemHealthDashboard";
 import {
   InteractiveLineChart,
@@ -1135,6 +1136,39 @@ type ValidationStatus = {
   interpretation: string;
 };
 
+function groupEnhancedSignals(signals: EnhancedSignal[]): Array<[string, EnhancedSignal[]]> {
+  const grouped = new Map<string, EnhancedSignal[]>();
+  for (const signal of signals) grouped.set(signal.signal_group, [...(grouped.get(signal.signal_group) ?? []), signal]);
+  return [...grouped.entries()];
+}
+
+function isRelevantWindowsEvent(event: EventRow): boolean {
+  if (event.event_level === "Critical" || event.event_level === "Error") return true;
+  if (event.event_level !== "Warning") return false;
+  return ["hardware_error", "unexpected_shutdown", "bugcheck", "resource_exhaustion", "storage_warning", "application_crash", "service_failure"]
+    .some((value) => event.smartops_category.toLocaleLowerCase().includes(value));
+}
+
+type UserReviewedSummary = {
+  status: "evaluated" | "collecting_user_reviews";
+  label: string;
+  precision: number | null;
+  confirmed_count: number;
+  false_positive_count: number;
+  reviewed_alert_count: number;
+  pending_count: number;
+  inconclusive_count: number;
+  unreviewed_count: number;
+  total_labelled_alert_count: number;
+  dataset_size: number;
+  review_coverage: number | null;
+  last_updated_utc: string | null;
+  formula: string;
+  full_accuracy: null;
+  full_accuracy_state: string;
+  interpretation: string;
+};
+
 type IncidentReport = {
   id: number;
   category: string;
@@ -1227,6 +1261,11 @@ const PAGE_DETAILS: Record<
     description:
       "Optional labelled outcomes used to evaluate predictive performance without changing automatic monitoring.",
   },
+  "technical-evidence": {
+    eyebrow: "Optional advanced records",
+    title: "Technical Evidence",
+    description: "Read-only access to exact stored evidence, provenance, versions and analytical records.",
+  },
   settings: {
     eyebrow: "Application preferences",
     title: "Settings",
@@ -1244,9 +1283,9 @@ function alertSeverityLabel(
 ): string {
   return {
     informational: "Low",
-    advisory: "Medium",
+    advisory: "Elevated",
     warning: "High",
-    urgent: "Critical",
+    urgent: "Critical Evidence",
   }[severity];
 }
 
@@ -1581,44 +1620,26 @@ function SignalLabel({ icon: Icon, children }: { icon: LucideIcon; children: str
   return <span className="detail-card__label"><span aria-hidden="true"><Icon size={16} /></span>{children}</span>;
 }
 
-function ProcessTable({
-  title,
-  rows,
-}: {
-  title: string;
-  rows: ProcessRow[];
+function ProcessSummary({ title, rows, resource, totalPercent, timestamp }: {
+  title: string; rows: ProcessRow[]; resource: "cpu" | "memory";
+  totalPercent: number | null; timestamp: string | null;
 }) {
+  const values = rows.map((row) => ({ ...row, value: resource === "cpu" ? row.cpu_percent : row.memory_percent }));
+  const recorded = values.reduce((sum, row) => sum + (row.value ?? 0), 0);
+  const remainder = totalPercent == null ? null : Math.max(0, totalPercent - recorded);
+  const colors = ["#168fd2", "#169b67", "#d99a24", "#8b5cf6", "#ed6a2c"];
   return (
-    <article className="process-card">
+    <article className="process-card process-summary">
       <h3>{title}</h3>
       {rows.length === 0 ? (
         <p className="unavailable-copy">No process snapshot is available.</p>
       ) : (
-        <div className="table-wrap table-wrap--plain">
-          <table>
-            <thead>
-              <tr>
-                <th>#</th>
-                <th>Process</th>
-                <th>PID</th>
-                <th>CPU</th>
-                <th>Memory</th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((process) => (
-                <tr key={`${process.rank}-${process.pid}`}>
-                  <td>{process.rank}</td>
-                  <td>{process.process_name}</td>
-                  <td>{process.pid}</td>
-                  <td>{formatPercent(process.cpu_percent)}</td>
-                  <td>{formatPercent(process.memory_percent)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+        <div className="process-bars" role="img" aria-label={`${title}. Recorded top-process snapshot${timestamp ? ` at ${timestamp}` : ""}.`}>
+          {values.map((process, index) => <div className="process-bar" key={`${process.rank}-${process.pid}`} tabIndex={0} aria-label={`${process.process_name}: ${formatPercent(process.value)}`}><div><strong>{process.process_name}</strong><span>{formatPercent(process.value)}</span></div><i><span style={{ width: `${Math.max(0, Math.min(100, process.value ?? 0))}%`, background: colors[index % colors.length] }} /></i></div>)}
+          <div className="process-bar process-bar--other" tabIndex={0} aria-label={remainder == null ? "Other and system activity was not quantified" : `Other and system: ${formatPercent(remainder)}`}><div><strong>Other / System</strong><span>{remainder == null ? "Not quantified" : formatPercent(remainder)}</span></div><i><span style={{ width: `${Math.min(100, remainder ?? 0)}%` }} /></i></div>
         </div>
       )}
+      <p className="process-snapshot-note">This shows the recorded top-process sample, not a claim that the listed processes account for all system use. Exact PID rows remain in Technical Evidence.</p>
     </article>
   );
 }
@@ -1717,9 +1738,13 @@ function App() {
   const [alertWorkload, setAlertWorkload] = useState("all");
   const [alertSearch, setAlertSearch] = useState("");
   const [alertValidation, setAlertValidation] = useState("all");
-  const [alertSort, setAlertSort] = useState<"newest" | "severity" | "confidence">("newest");
+  const [alertSort, setAlertSort] = useState<"newest" | "severity">("newest");
+  const [alertView, setAlertView] = useState<"attention" | "observations" | "all">("attention");
+  const [alertHistoryPage, setAlertHistoryPage] = useState(0);
+  const [alertMatchingTotal, setAlertMatchingTotal] = useState(0);
   const [acknowledgingAlert, setAcknowledgingAlert] = useState<number | null>(null);
   const [validation, setValidation] = useState<ValidationStatus | null>(null);
+  const [userReviewedSummary, setUserReviewedSummary] = useState<UserReviewedSummary | null>(null);
   const [validationRegistry, setValidationRegistry] = useState<MethodValidation[]>([]);
   const [incidents, setIncidents] = useState<IncidentReport[]>([]);
   const [observationPeriods, setObservationPeriods] = useState<ObservationPeriod[]>([]);
@@ -2044,12 +2069,14 @@ function App() {
           notificationStatusResponse,
         ] = await Promise.all([
           fetchJson<AlertStatus>(requestUrl("/api/alerts/status"), signal),
-          fetchJson<{ items: PredictiveAlert[] }>(
+          fetchJson<{ items: PredictiveAlert[]; total: number }>(
             requestUrl("/api/alerts/history", {
-              limit: 50,
-              offset: 0,
-              sort: "newest",
+              limit: 25,
+              offset: alertHistoryPage * 25,
+              sort: alertSort,
               summary: "true",
+              view: alertView,
+              ...(alertSearch.trim() ? { search: alertSearch.trim() } : {}),
               ...(selectedStart ? { start: selectedStart } : {}),
               ...(alertSeverity === "all" ? {} : { severity: alertSeverity }),
               ...(alertState === "all" ? {} : { state: alertState }),
@@ -2076,6 +2103,7 @@ function App() {
               ]
             : alertPage.items;
         });
+        setAlertMatchingTotal(alertPage.total ?? alertPage.items.length);
         setBaseline(baselineResponse);
         setRiskStatus(riskStatusResponse);
         setHealthStatus(healthStatusResponse);
@@ -2221,7 +2249,7 @@ function App() {
         setNotificationStatus(notificationStatusResponse);
         setBaseline(baselineResponse);
         setBaselineManagement(baselineManagementResponse);
-      } else {
+      } else if (activeRoute === "research-validation") {
         const [
           validationResponse,
           incidentResponse,
@@ -2230,6 +2258,7 @@ function App() {
           feedbackResponse,
           validationRegistryResponse,
           fineQualityResponse,
+          userReviewedResponse,
         ] = await Promise.all([
           fetchJson<ValidationStatus>(requestUrl("/api/validation/status"), signal),
           fetchJson<{ items: IncidentReport[] }>(
@@ -2256,6 +2285,10 @@ function App() {
             requestUrl("/api/quality/profile-taxonomy"),
             signal,
           ),
+          fetchJson<UserReviewedSummary>(
+            requestUrl("/api/validation/user-reviewed-summary"),
+            signal,
+          ),
         ]);
         if (!isCurrent()) return;
         setValidation(validationResponse);
@@ -2265,6 +2298,7 @@ function App() {
         setFeedbackHistory(feedbackResponse.items);
         setValidationRegistry(validationRegistryResponse.items ?? []);
         setFineQuality(fineQualityResponse);
+        setUserReviewedSummary(userReviewedResponse);
       }
 
       if (!isCurrent()) return;
@@ -2283,8 +2317,12 @@ function App() {
   }, [
     activeRoute,
     alertCategory,
+    alertHistoryPage,
+    alertSearch,
     alertSeverity,
+    alertSort,
     alertState,
+    alertView,
     alertWorkload,
     deviationWorkload,
     healthWorkload,
@@ -2468,15 +2506,16 @@ function App() {
         return severityRank[right.current_severity] - severityRank[left.current_severity]
           || Date.parse(right.latest_observed_utc) - Date.parse(left.latest_observed_utc);
       }
-      if (alertSort === "confidence") {
-        return (right.alert_confidence ?? -1) - (left.alert_confidence ?? -1)
-          || Date.parse(right.latest_observed_utc) - Date.parse(left.latest_observed_utc);
-      }
       return Date.parse(right.latest_observed_utc) - Date.parse(left.latest_observed_utc);
     });
   }, [alertHistory, alertSearch, alertSort, alertValidation]);
   const activeAlerts = filteredAlertHistory.filter((item) => item.state !== "resolved");
   const resolvedAlerts = filteredAlertHistory.filter((item) => item.state === "resolved");
+  const relevantEvents = events.filter(isRelevantWindowsEvent);
+  const relevantEventCategories = relevantEvents.reduce<Record<string, number>>((counts, event) => {
+    counts[event.smartops_category] = (counts[event.smartops_category] ?? 0) + 1;
+    return counts;
+  }, {});
   const validationMetrics = Object.fromEntries(
     (validation?.latest_run?.metrics ?? [])
       .filter((item) => item.scope_type === "overall")
@@ -2579,8 +2618,10 @@ function App() {
         body: JSON.stringify({ outcome, note: null }),
       });
       if (!response.ok) throw new Error("Outcome label could not be stored.");
+      const result = await response.json() as { user_reviewed_summary: UserReviewedSummary };
+      setUserReviewedSummary(result.user_reviewed_summary);
       setOutcomeMessage(
-        "Outcome label stored for academic validation only; no scoring or baseline changed.",
+        "Outcome review saved. Research & Validation has been refreshed; monitoring and the personal baseline were not changed.",
       );
       await loadMetrics();
     } catch (error) {
@@ -3172,8 +3213,9 @@ function App() {
                   </article>
                 </div>
 
-                <div className="enhanced-signal-grid">
-                  {enhancedEvidence.signals.map((signal) => (
+                <div className="enhanced-signal-groups">
+                  {groupEnhancedSignals(enhancedEvidence.signals).map(([group, signals]) => <section className="enhanced-signal-group" key={group}><h3>{group.replaceAll("_", " ")}</h3><div className="enhanced-signal-grid">
+                  {signals.map((signal) => (
                     <article
                       className={`enhanced-signal-card enhanced-signal-card--${(signal.display_state ?? (signal.availability_status === "available" ? "Available" : "Temporarily unavailable")).toLowerCase().replaceAll(" ", "-")}`}
                       key={signal.signal_key}
@@ -3198,27 +3240,23 @@ function App() {
                           <dd>{signal.display_state ?? signal.readiness_state.replaceAll("_", " ")}</dd>
                         </div>
                         <div>
-                          <dt>Available readings</dt>
-                          <dd>{(signal.available_history_count ?? (signal.numeric_value == null ? 0 : 1)).toLocaleString()}</dd>
-                        </div>
-                        <div>
                           <dt>Last collection</dt>
                           <dd>{formatTimestamp(signal.timestamp_utc)}</dd>
                         </div>
                       </dl>
-                      <p>{signal.source_name}</p>
                       {signal.reason_code && (
                         <small>
                           Reason: {signal.reason_code.replaceAll("_", " ")}
                         </small>
                       )}
                     </article>
-                  ))}
+                  ))}</div></section>)}
                 </div>
               </>
             )}
 
-            <details className="enhanced-technical-panel">
+            <a className="technical-evidence-link" href="#/technical-evidence?dataset=advanced-signals">Open source, cadence, overhead and complete Advanced Signal records in Technical Evidence</a>
+            <details className="enhanced-technical-panel" hidden>
               <summary>Technical Details</summary>
               <p>
                 Collector cadence, source diagnostics, query duration, and measured local-agent overhead.
@@ -3455,12 +3493,12 @@ function App() {
               {["Critical", "Error", "Warning"].map((level) => (
                 <article className="detail-card" key={level}>
                   <span>{level} events</span>
-                  <strong>{eventSummary?.severity[level] ?? 0}</strong>
+                  <strong>{relevantEvents.filter((event) => event.event_level === level).length}</strong>
                 </article>
               ))}
             </div>
             <div className="event-categories" aria-label="Event counts by category">
-              {Object.entries(eventSummary?.categories ?? {}).map(
+              {Object.entries(relevantEventCategories).map(
                 ([category, count]) => (
                   <article className="detail-card" key={category}>
                     <span>{category.replaceAll("_", " ")}</span>
@@ -3468,15 +3506,15 @@ function App() {
                   </article>
                 ),
               )}
-              {Object.keys(eventSummary?.categories ?? {}).length === 0 && (
-                <p>No mapped event categories have been stored.</p>
+              {Object.keys(relevantEventCategories).length === 0 && (
+                <p>No relevant event categories are present in the current bounded view.</p>
               )}
             </div>
             <div className="table-wrap">
               <table>
                 <thead><tr><th>Time</th><th>Level</th><th>Channel</th><th>Category</th><th>Event</th><th>Safe summary</th></tr></thead>
                 <tbody>
-                  {events.map((event) => (
+                  {relevantEvents.map((event) => (
                     <tr key={event.id}>
                       <td>{formatTimestamp(event.event_timestamp_utc)}</td>
                       <td>{event.event_level}</td><td>{event.channel}</td>
@@ -3485,13 +3523,14 @@ function App() {
                       <td>{event.safe_summary}</td>
                     </tr>
                   ))}
-                  {events.length === 0 && <tr><td colSpan={6}>No relevant events stored.</td></tr>}
+                  {relevantEvents.length === 0 && <tr><td colSpan={6}>No recent critical, error, or relevant warning events were recorded.</td></tr>}
                 </tbody>
               </table>
             </div>
+            <a className="technical-evidence-link" href="#/technical-evidence?dataset=windows-events">View all mapped Windows events in Technical Evidence</a>
           </section>
 
-          <section className="phase2b-section" hidden={activeRoute !== "live-monitoring"}>
+          <section className="phase2b-section" hidden>
             <div className="section-heading">
               <div>
                 <p className="eyebrow">Five-minute features</p>
@@ -4664,9 +4703,9 @@ function App() {
                 <p>Open, acknowledged, or recovering conditions</p>
               </article>
               {([
-                ["urgent", "Critical"],
+                ["urgent", "Critical Evidence"],
                 ["warning", "High"],
-                ["advisory", "Medium"],
+                ["advisory", "Elevated"],
                 ["informational", "Low"],
               ] as const).map(([severity, label]) => (
                 <article className={`alert-summary__severity alert-summary__severity--${severity}`} key={severity}>
@@ -4688,12 +4727,19 @@ function App() {
             </div>
 
             <div className="alert-filters">
+              <div className="alert-view-switcher" role="group" aria-label="Alert activity view">
+                {([[
+                  "attention", "Needs attention",
+                ], ["observations", "Observations"], ["all", "All activity"]] as const).map(([value, label]) => (
+                  <button type="button" key={value} aria-pressed={alertView === value} onClick={() => { setAlertView(value); setAlertHistoryPage(0); }}>{label}</button>
+                ))}
+              </div>
               <label className="alert-filter-search">
                 <span>Search stored alerts</span>
                 <input
                   type="search"
                   value={alertSearch}
-                  onChange={(event) => setAlertSearch(event.target.value)}
+                  onChange={(event) => { setAlertSearch(event.target.value); setAlertHistoryPage(0); }}
                   placeholder="Title, category, basis, or workload"
                 />
               </label>
@@ -4701,20 +4747,20 @@ function App() {
                 <span>Severity</span>
                 <select
                   value={alertSeverity}
-                  onChange={(event) => setAlertSeverity(event.target.value)}
+                  onChange={(event) => { setAlertSeverity(event.target.value); setAlertHistoryPage(0); }}
                 >
                   <option value="all">All severities</option>
-                  <option value="informational">Informational</option>
-                  <option value="advisory">Advisory</option>
-                  <option value="warning">Warning</option>
-                  <option value="urgent">Urgent</option>
+                  <option value="informational">Low</option>
+                  <option value="advisory">Elevated</option>
+                  <option value="warning">High</option>
+                  <option value="urgent">Critical Evidence</option>
                 </select>
               </label>
               <label>
                 <span>State</span>
                 <select
                   value={alertState}
-                  onChange={(event) => setAlertState(event.target.value)}
+                  onChange={(event) => { setAlertState(event.target.value); setAlertHistoryPage(0); }}
                 >
                   <option value="all">All states</option>
                   <option value="open">Open</option>
@@ -4727,7 +4773,7 @@ function App() {
                 <span>Category</span>
                 <select
                   value={alertCategory}
-                  onChange={(event) => setAlertCategory(event.target.value)}
+                  onChange={(event) => { setAlertCategory(event.target.value); setAlertHistoryPage(0); }}
                 >
                   <option value="all">All categories</option>
                   <option value="resource_pressure">Resource pressure</option>
@@ -4746,20 +4792,23 @@ function App() {
                 <span>Workload</span>
                 <select
                   value={alertWorkload}
-                  onChange={(event) => setAlertWorkload(event.target.value)}
+                  onChange={(event) => { setAlertWorkload(event.target.value); setAlertHistoryPage(0); }}
                 >
                   <option value="all">All workloads</option>
                   <option value="idle">Idle</option>
-                  <option value="light_desktop">Light desktop</option>
+                  <option value="interactive_light">Interactive light</option>
+                  <option value="background_activity">Background activity</option>
+                  <option value="browser_or_media">Browser/Media</option>
                   <option value="development">Development</option>
-                  <option value="gaming_or_3d">Gaming or 3D</option>
+                  <option value="gaming_or_3d">Gaming/3D</option>
+                  <option value="guided_development">Guided development</option>
+                  <option value="office_productivity">Office productivity</option>
                   <option value="compute_intensive">Compute intensive</option>
-                  <option value="mixed">Mixed</option>
                 </select>
               </label>
               <label>
                 <span>Time range</span>
-                <select value={range} onChange={(event) => { setRange(event.target.value as HistoryRange); setPage(0); }}>
+                <select value={range} onChange={(event) => { setRange(event.target.value as HistoryRange); setPage(0); setAlertHistoryPage(0); }}>
                   <option value="1h">Last hour</option>
                   <option value="6h">Last 6 hours</option>
                   <option value="24h">Last 24 hours</option>
@@ -4779,7 +4828,6 @@ function App() {
                 <select value={alertSort} onChange={(event) => setAlertSort(event.target.value as typeof alertSort)}>
                   <option value="newest">Newest activity</option>
                   <option value="severity">Highest severity</option>
-                  <option value="confidence">Strongest available confidence</option>
                 </select>
               </label>
               <div className="alert-filter-actions">
@@ -4791,6 +4839,8 @@ function App() {
                   setAlertWorkload("all");
                   setAlertValidation("all");
                   setAlertSort("newest");
+                  setAlertView("attention");
+                  setAlertHistoryPage(0);
                   setRange("1h");
                   setPage(0);
                 }}>Reset filters</button>
@@ -4829,7 +4879,7 @@ function App() {
                   >
                     <header>
                       <div>
-                        <span>{alert.alert_code} · {alert.category.replaceAll("_", " ")}</span>
+                        <span>{alert.category.replaceAll("_", " ")}</span>
                         <h3>{alert.title}</h3>
                       </div>
                       <div className="alert-labels">
@@ -4843,30 +4893,15 @@ function App() {
                     </header>
                     <p>{alert.description}</p>
                     <p className="alert-short-basis"><strong>Alert basis:</strong> {alert.short_alert_basis ?? "Legacy alert evidence is available in the expanded record."}</p>
-                    <p className="alert-science-note">
-                      Alert confidence describes evidence strength, completeness, and consistency; it is not failure probability. No score, deviation, risk value, or confidence value is presented as accuracy.
-                    </p>
                     <div className="alert-facts">
-                      <span><strong>Alert confidence:</strong> {alert.alert_confidence == null ? "Not available" : `${alert.alert_confidence.toFixed(1)}% (${alert.confidence_label})`}</span>
+                      <span><strong>Evidence strength:</strong> {alert.alert_confidence == null ? "Not available" : `${alert.alert_confidence.toFixed(0)}% (${alert.confidence_label})`}</span>
                       <span><strong>Method validation:</strong> {alert.validation?.display_label ?? "Not yet validated"}</span>
-                      <span><strong>Evidence:</strong> {alert.evaluation_state.replaceAll("_", " ")}</span>
-                      <span><strong>Data confidence:</strong> {alert.data_confidence.toFixed(1)}%</span>
-                      <span><strong>Generated:</strong> {formatTimestamp(alert.first_observed_utc)}</span>
                       <span><strong>Latest observed:</strong> {formatTimestamp(alert.latest_observed_utc)}</span>
-                      <span><strong>Evidence period:</strong> {alert.explanation_snapshot ? `${formatTimestamp(alert.explanation_snapshot.evidence_start_utc)} to ${formatTimestamp(alert.explanation_snapshot.evidence_end_utc)}` : "Not available for this legacy alert"}</span>
-                      <span><strong>Notification:</strong> {alert.summary_record ? "Open details to view history" : alert.notification_deliveries?.at(-1)?.delivery_status.replaceAll("_", " ") ?? "No delivery recorded"}</span>
-                      <span><strong>Duration:</strong> {formatDuration(alert.duration_seconds)}</span>
-                      <span><strong>Occurrences:</strong> {alert.occurrence_count}</span>
-                      <span><strong>Persistence:</strong> {alert.consecutive_window_count} windows</span>
-                      <span><strong>Trend:</strong> {alert.trend_direction.replaceAll("_", " ")}</span>
-                      <span><strong>Recovery:</strong> {alert.recovery_state.replaceAll("_", " ")}</span>
                       <span>
                         <strong>Workload:</strong>{" "}
                         {alert.workload_context?.replaceAll("_", " ") ?? "Unavailable"}
-                        {alert.workload_confidence === null
-                          ? ""
-                          : ` (${(alert.workload_confidence * 100).toFixed(0)}%)`}
                       </span>
+                      <span><strong>State:</strong> {alert.state.replaceAll("_", " ")}</span>
                     </div>
                     <button
                       type="button"
@@ -4880,7 +4915,7 @@ function App() {
                         ? <ChevronUp size={18} aria-hidden="true" />
                         : <ChevronDown size={18} aria-hidden="true" />}
                     </button>
-                    {alert.id === selectedAlertId ? (
+                    {false && alert.explanation_snapshot && selectedAlertRisk && alert.id === selectedAlertId ? (
                     alertDetailLoading ? (
                       <div id={`alert-details-${alert.id}`} className="alert-detail-loading" role="status" aria-live="polite">
                         <span className="loading-spinner" aria-hidden="true" />
@@ -4901,51 +4936,51 @@ function App() {
                         <p>Legacy alert — detailed explanation was not recorded when this alert was generated.</p>
                       ) : (
                         <div className="alert-explanation-content">
-                          <p>{alert.explanation_snapshot.plain_language_explanation}</p>
+                          <p>{alert.explanation_snapshot!.plain_language_explanation}</p>
                           <dl className="alert-facts">
-                            <div><dt>Evidence window</dt><dd>{formatTimestamp(alert.explanation_snapshot.evidence_start_utc)} to {formatTimestamp(alert.explanation_snapshot.evidence_end_utc)}</dd></div>
-                            <div><dt>Completeness</dt><dd>{(alert.explanation_snapshot.evidence_completeness * 100).toFixed(1)}% from {alert.explanation_snapshot.source_sample_count} samples</dd></div>
+                            <div><dt>Evidence window</dt><dd>{formatTimestamp(alert.explanation_snapshot!.evidence_start_utc)} to {formatTimestamp(alert.explanation_snapshot!.evidence_end_utc)}</dd></div>
+                            <div><dt>Completeness</dt><dd>{(alert.explanation_snapshot!.evidence_completeness * 100).toFixed(1)}% from {alert.explanation_snapshot!.source_sample_count} samples</dd></div>
                           </dl>
                           <h4>Alert confidence components</h4>
                           <p>Evidence confidence describes evidence quality and consistency. It is not the probability that a failure will occur.</p>
-                          {alert.explanation_snapshot.alert_confidence === null ? <p>Confidence unavailable</p> : (
+                          {alert.explanation_snapshot!.alert_confidence === null ? <p>Confidence unavailable</p> : (
                             <div className="table-wrap"><table><thead><tr><th>Component</th><th>Value</th><th>Weight</th><th>Contribution</th><th>Explanation</th></tr></thead><tbody>
-                              {alert.explanation_snapshot.confidence_components.map((component) => <tr key={component.component_key}><td>{component.component_key.replaceAll("_", " ")}</td><td>{component.component_value === null ? "Unavailable" : `${component.component_value.toFixed(1)}%`}</td><td>{(component.configured_weight * 100).toFixed(1)}%</td><td>{component.weighted_contribution === null ? "Excluded" : component.weighted_contribution.toFixed(2)}</td><td>{component.explanation}</td></tr>)}
+                              {alert.explanation_snapshot!.confidence_components.map((component) => <tr key={component.component_key}><td>{component.component_key.replaceAll("_", " ")}</td><td>{component.component_value === null ? "Unavailable" : `${component.component_value.toFixed(1)}%`}</td><td>{(component.configured_weight * 100).toFixed(1)}%</td><td>{component.weighted_contribution === null ? "Excluded" : component.weighted_contribution.toFixed(2)}</td><td>{component.explanation}</td></tr>)}
                             </tbody></table></div>
                           )}
                           <h4>Method-level validation</h4>
-                          {alert.explanation_snapshot.validation.validation_type === "not_yet_validated" ? (
+                          {alert.explanation_snapshot!.validation.validation_type === "not_yet_validated" ? (
                             <div className="alert-validation-empty">
                               <strong>Not yet validated</strong>
                               <p>Individual alert correctness requires confirmed outcomes. No score, deviation, risk value, or confidence value is presented as accuracy.</p>
                             </div>
                           ) : (
                             <dl className="alert-validation-grid">
-                              <div><dt>Precision</dt><dd>{validationPercent(alert.explanation_snapshot.validation.precision)}</dd></div>
-                              <div><dt>Recall</dt><dd>{validationPercent(alert.explanation_snapshot.validation.recall)}</dd></div>
-                              <div><dt>F1 score</dt><dd>{validationPercent(alert.explanation_snapshot.validation.f1_score)}</dd></div>
-                              <div><dt>False-positive rate</dt><dd>{validationPercent(alert.explanation_snapshot.validation.false_positive_rate)}</dd></div>
-                              <div><dt>Accuracy</dt><dd>{validationPercent(alert.explanation_snapshot.validation.accuracy)}</dd></div>
-                              <div><dt>Labelled sample/event count</dt><dd>{alert.explanation_snapshot.validation.sample_size.toLocaleString()}</dd></div>
-                              <div><dt>Validation date</dt><dd>{alert.explanation_snapshot.validation.validation_date_utc ? formatTimestamp(alert.explanation_snapshot.validation.validation_date_utc) : "Not available"}</dd></div>
-                              <div><dt>Dataset / experiment</dt><dd>{alert.explanation_snapshot.validation.dataset_description ?? "Not available"}</dd></div>
+                              <div><dt>Precision</dt><dd>{validationPercent(alert.explanation_snapshot!.validation.precision)}</dd></div>
+                              <div><dt>Recall</dt><dd>{validationPercent(alert.explanation_snapshot!.validation.recall)}</dd></div>
+                              <div><dt>F1 score</dt><dd>{validationPercent(alert.explanation_snapshot!.validation.f1_score)}</dd></div>
+                              <div><dt>False-positive rate</dt><dd>{validationPercent(alert.explanation_snapshot!.validation.false_positive_rate)}</dd></div>
+                              <div><dt>Accuracy</dt><dd>{validationPercent(alert.explanation_snapshot!.validation.accuracy)}</dd></div>
+                              <div><dt>Labelled sample/event count</dt><dd>{alert.explanation_snapshot!.validation.sample_size.toLocaleString()}</dd></div>
+                              <div><dt>Validation date</dt><dd>{alert.explanation_snapshot!.validation.validation_date_utc ? formatTimestamp(alert.explanation_snapshot!.validation.validation_date_utc!) : "Not available"}</dd></div>
+                              <div><dt>Dataset / experiment</dt><dd>{alert.explanation_snapshot!.validation.dataset_description ?? "Not available"}</dd></div>
                             </dl>
                           )}
-                          {alert.explanation_snapshot.validation.limitations.length > 0 && (
-                            <p className="alert-validation-limitations">{alert.explanation_snapshot.validation.limitations.join(" ")}</p>
+                          {alert.explanation_snapshot!.validation.limitations.length > 0 && (
+                            <p className="alert-validation-limitations">{alert.explanation_snapshot!.validation.limitations.join(" ")}</p>
                           )}
                           <details className="alert-technical-details">
                             <summary>Technical Details</summary>
                             <dl className="alert-facts">
-                              <div><dt>Rule/model version</dt><dd>{alert.explanation_snapshot.triggering_rule_identifier} · {alert.explanation_snapshot.triggering_rule_version}</dd></div>
-                              <div><dt>Baseline version</dt><dd>{alert.explanation_snapshot.baseline_version == null ? "Not available" : `v${alert.explanation_snapshot.baseline_version}`}</dd></div>
-                              <div><dt>Explanation version</dt><dd>{alert.explanation_snapshot.explanation_version}</dd></div>
+                              <div><dt>Rule/model version</dt><dd>{alert.explanation_snapshot!.triggering_rule_identifier} · {alert.explanation_snapshot!.triggering_rule_version}</dd></div>
+                              <div><dt>Baseline version</dt><dd>{alert.explanation_snapshot!.baseline_version == null ? "Not available" : `v${alert.explanation_snapshot!.baseline_version}`}</dd></div>
+                              <div><dt>Explanation version</dt><dd>{alert.explanation_snapshot!.explanation_version}</dd></div>
                             </dl>
                             <div className="alert-explanation-columns">
-                              <div><h4>Observed values</h4><pre>{JSON.stringify(alert.explanation_snapshot.observed_values, null, 2)}</pre></div>
-                              <div><h4>Baseline / expected values</h4><pre>{JSON.stringify(alert.explanation_snapshot.baseline_values, null, 2)}</pre></div>
-                              <div><h4>Thresholds</h4><pre>{JSON.stringify(alert.explanation_snapshot.thresholds, null, 2)}</pre></div>
-                              <div><h4>Recorded differences / deviations</h4><pre>{JSON.stringify(alert.explanation_snapshot.deviations, null, 2)}</pre></div>
+                              <div><h4>Observed values</h4><pre>{JSON.stringify(alert.explanation_snapshot!.observed_values, null, 2)}</pre></div>
+                              <div><h4>Baseline / expected values</h4><pre>{JSON.stringify(alert.explanation_snapshot!.baseline_values, null, 2)}</pre></div>
+                              <div><h4>Thresholds</h4><pre>{JSON.stringify(alert.explanation_snapshot!.thresholds, null, 2)}</pre></div>
+                              <div><h4>Recorded differences / deviations</h4><pre>{JSON.stringify(alert.explanation_snapshot!.deviations, null, 2)}</pre></div>
                             </div>
                           </details>
                         </div>
@@ -5028,11 +5063,11 @@ function App() {
                           Risk Evidence Index:{" "}
                           <strong>
                             {selectedAlertRisk
-                              ? selectedAlertRisk.risk_evidence_index.toFixed(1)
+                              ? selectedAlertRisk!.risk_evidence_index.toFixed(1)
                               : "Not evaluated for this window"}
                           </strong>
                           {selectedAlertRisk
-                            ? ` · ${selectedAlertRisk.evidence_level.replaceAll("_", " ")} · ${selectedAlertRisk.temporal_pattern.replaceAll("_", " ")}`
+                            ? ` · ${selectedAlertRisk!.evidence_level.replaceAll("_", " ")} · ${selectedAlertRisk!.temporal_pattern.replaceAll("_", " ")}`
                             : ""}
                         </p>
                         {selectedAlertCandidates.length > 0 && (
@@ -5067,6 +5102,7 @@ function App() {
                     </div>
                     )
                     ) : null}
+                    {alert.id === selectedAlertId ? renderAlertDetails(alert) : null}
                     <footer>
                       <details className="alert-version-details">
                         <summary>Technical record versions</summary>
@@ -5107,7 +5143,7 @@ function App() {
                   <p className="eyebrow">Preserved lifecycle history</p>
                   <h3>Resolved alerts</h3>
                 </div>
-                <span>{resolvedAlerts.length} shown in selected filters</span>
+                <span>{resolvedAlerts.length} on this page · {alertMatchingTotal.toLocaleString()} total matches</span>
               </div>
               {resolvedAlerts.length === 0 ? (
                 <p>No resolved alerts match the selected filters and time range.</p>
@@ -5160,6 +5196,12 @@ function App() {
                   </table>
                 </div>
               )}
+            </div>
+
+            <div className="pagination" aria-label="Alert history pages">
+              <button type="button" disabled={alertHistoryPage === 0} onClick={() => setAlertHistoryPage((value) => Math.max(0, value - 1))}>Previous</button>
+              <span>Page {alertHistoryPage + 1} · {alertMatchingTotal.toLocaleString()} matching lifecycles</span>
+              <button type="button" disabled={(alertHistoryPage + 1) * 25 >= alertMatchingTotal} onClick={() => setAlertHistoryPage((value) => value + 1)}>Next</button>
             </div>
 
             <details className="alert-version">
@@ -5302,6 +5344,12 @@ function App() {
                   ))}
               </div>
             </details>
+
+            <section className="preliminary-review-summary" aria-label="Preliminary user-reviewed result">
+              <div><p className="eyebrow">Preliminary user-reviewed result</p><h3>{userReviewedSummary?.precision == null ? "No alerts have been reviewed yet." : `Preliminary user-reviewed precision: ${(userReviewedSummary.precision * 100).toFixed(1)}%`}</h3><p>{userReviewedSummary?.precision == null ? "Choose an outcome on an alert after checking the computer." : `Based on ${userReviewedSummary.reviewed_alert_count} decisively reviewed alert${userReviewedSummary.reviewed_alert_count === 1 ? "" : "s"}.`}</p></div>
+              <dl><div><dt>Confirmed</dt><dd>{userReviewedSummary?.confirmed_count ?? 0}</dd></div><div><dt>False positive</dt><dd>{userReviewedSummary?.false_positive_count ?? 0}</dd></div><div><dt>Pending</dt><dd>{userReviewedSummary?.pending_count ?? 0}</dd></div><div><dt>Inconclusive</dt><dd>{userReviewedSummary?.inconclusive_count ?? 0}</dd></div><div><dt>Unreviewed</dt><dd>{userReviewedSummary?.unreviewed_count?.toLocaleString() ?? "Not available"}</dd></div><div><dt>Dataset size</dt><dd>{userReviewedSummary?.dataset_size?.toLocaleString() ?? "Not available"}</dd></div><div><dt>Review coverage</dt><dd>{userReviewedSummary?.review_coverage == null ? "Not available" : `${(userReviewedSummary.review_coverage * 100).toFixed(1)}%`}</dd></div><div><dt>Last updated</dt><dd>{userReviewedSummary?.last_updated_utc ? formatTimestamp(userReviewedSummary.last_updated_utc) : "No reviews yet"}</dd></div></dl>
+              <p>Confirmed / (Confirmed + False positive). This is not full model accuracy. Full accuracy remains collecting until eligible true-negative and false-negative evidence exists.</p>
+            </section>
 
             <div className="validation-summary" aria-label="Validation summary">
               {(["precision", "recall", "accuracy", "balanced_accuracy"] as const).map(
@@ -5827,6 +5875,10 @@ function App() {
               matching {validation?.matching_version ?? "Unavailable"}
             </p>
           </section>
+
+          {activeRoute === "technical-evidence" && (
+            <TechnicalEvidence apiBaseUrl={API_BASE_URL} />
+          )}
 
           <section
             id="pc-quality-profile-selector"
@@ -6501,6 +6553,7 @@ function App() {
                     <option value="research-validation">
                       Research &amp; Validation
                     </option>
+                    <option value="technical-evidence">Technical Evidence</option>
                     <option value="settings">Settings</option>
                   </select>
                 </label>
@@ -7140,15 +7193,19 @@ function App() {
               <span>Names and utilization only - no command lines</span>
             </div>
             <div className="process-grid">
-              <ProcessTable title="Top five by CPU" rows={processes?.cpu ?? []} />
-              <ProcessTable
+              <ProcessSummary title="Top five by CPU" rows={processes?.cpu ?? []} resource="cpu" totalPercent={latest?.cpu_percent ?? null} timestamp={processes?.timestamp_utc ?? null} />
+              <ProcessSummary
                 title="Top five by memory"
                 rows={processes?.memory ?? []}
+                resource="memory"
+                totalPercent={latest?.ram_percent ?? null}
+                timestamp={processes?.timestamp_utc ?? null}
               />
             </div>
+            <a className="technical-evidence-link" href="#/technical-evidence?dataset=monitoring">Open complete process and raw telemetry records in Technical Evidence</a>
           </section>
 
-          <section className="history-section" hidden={activeRoute !== "live-monitoring"}>
+          <section className="history-section" hidden>
             <div className="section-heading">
               <div>
                 <p className="eyebrow">Raw records</p>

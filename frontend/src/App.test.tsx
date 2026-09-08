@@ -999,10 +999,8 @@ describe("deployment-ready SmartOps dashboard", () => {
     await renderAt("#/live-monitoring");
     expect(screen.getAllByText("User activity").length).toBeGreaterThan(0);
     expect(screen.getAllByText("background").length).toBeGreaterThan(0);
-    expect(
-      screen.getByText(/Development was observed in 4 of 10 samples/i),
-    ).toBeVisible();
-    expect(screen.getByText(/Mixed context: guided development/i)).toBeVisible();
+    expect(screen.getByRole("link", { name: /Open complete process and raw telemetry records/ })).toBeVisible();
+    expect(screen.queryByText(/Development was observed in 4 of 10 samples/i)).not.toBeVisible();
   });
 
   it("shows capability-aware advanced signals without development branding", async () => {
@@ -1032,10 +1030,9 @@ describe("deployment-ready SmartOps dashboard", () => {
     await renderAt("#/predictive-alerts");
     expect(screen.getByText("Sustained CPU pressure")).toBeVisible();
     await userEvent.click(screen.getByRole("button", { name: "View details" }));
-    await screen.findByText("Lifecycle and notification history");
-    expect(screen.getByText(/Legacy alert — detailed explanation was not recorded/))
-      .toBeInTheDocument();
-    expect(screen.getByText(/Method validation:/).closest("span"))
+    await screen.findByText("What SmartOps detected");
+    expect(screen.getAllByText(/CPU pressure persisted/).length).toBeGreaterThan(0);
+    expect(screen.getByText("Method validation").nextElementSibling)
       .toHaveTextContent("Not yet validated");
     const button = screen.getByRole("button", { name: "I have seen this alert" });
     expect(button).toHaveAttribute("title", expect.stringContaining("does not resolve"));
@@ -1073,7 +1070,7 @@ describe("deployment-ready SmartOps dashboard", () => {
       name: "Full details for Memory and page-file pressure",
     });
     expect(details).toBeVisible();
-    expect(within(details).getByText("Why the alert was generated")).toBeVisible();
+    expect(within(details).getByText("What SmartOps detected")).toBeVisible();
     expect(within(details).getByText("Not yet validated")).toBeVisible();
     expect(fetch).toHaveBeenCalledWith(
       expect.stringContaining("/api/alerts/18"),
@@ -1099,11 +1096,11 @@ describe("deployment-ready SmartOps dashboard", () => {
     };
     scenario.alerts = [resolvedAlert];
     scenario.alertHistoryUsesSummaries = true;
-    scenario.alertDetailDelayMs = 500;
+    scenario.alertDetailDelayMs = 2_000;
     await renderAt("#/predictive-alerts");
     await userEvent.click(screen.getByRole("button", { name: "View details" }));
     expect(screen.getByText(/Loading full alert details from the local database/)).toBeVisible();
-    await screen.findByRole("region", { name: /Full details for Memory/i }, { timeout: 2_000 });
+    await screen.findByText("What SmartOps detected", {}, { timeout: 4_000 });
 
     await userEvent.click(screen.getByRole("button", { name: "Hide details" }));
     scenario.alertDetailDelayMs = 0;
@@ -1148,7 +1145,7 @@ describe("deployment-ready SmartOps dashboard", () => {
     scenario.alerts = [sampleAlert];
     await renderAt("#/predictive-alerts");
     const search = screen.getByRole("searchbox", { name: "Search stored alerts" });
-    await userEvent.type(search, "browser history");
+    fireEvent.change(search, { target: { value: "browser history" } });
     expect(screen.queryByText("Sustained CPU pressure")).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Reset filters" }));
     expect(search).toHaveValue("");
@@ -1179,13 +1176,12 @@ describe("deployment-ready SmartOps dashboard", () => {
       notification_deliveries: [],
     }];
     await renderAt("#/predictive-alerts");
-    expect(screen.getByText(/82.0% \(high\)/i)).toBeVisible();
+    expect(screen.getAllByText(/82%.*high/i).length).toBeGreaterThan(0);
     await userEvent.click(screen.getByRole("button", { name: "View details" }));
-    await screen.findByText("Lifecycle and notification history");
+    await screen.findByText("What SmartOps detected");
     expect(screen.getAllByText("Not yet validated").length).toBeGreaterThan(0);
-    expect(screen.getByText(/No score, deviation, risk value, or confidence value is presented as accuracy/i)).toBeVisible();
-    await userEvent.click(screen.getByText("Lifecycle and notification history"));
-    expect(screen.getByText("Evidence observed")).toBeVisible();
+    expect(screen.getByText(/Evidence strength describes completeness and consistency/i)).toBeVisible();
+    expect(screen.getByRole("link", { name: "View exact Technical Evidence" })).toHaveAttribute("href", "#/technical-evidence?dataset=alerts&contextId=7");
     expect(screen.queryByText("Notification delivered")).not.toBeInTheDocument();
   });
 
@@ -1231,13 +1227,10 @@ describe("deployment-ready SmartOps dashboard", () => {
     }];
     await renderAt("#/predictive-alerts");
     await userEvent.click(screen.getByRole("button", { name: "View details" }));
-    await screen.findByText("Lifecycle and notification history");
-    await userEvent.click(screen.getByText("Why was this alert generated?"));
-    expect(screen.getByText("Precision").nextElementSibling).toHaveTextContent("80.0%");
-    expect(screen.getByText("Recall").nextElementSibling).toHaveTextContent("66.7%");
-    expect(screen.getByText("F1 score").nextElementSibling).toHaveTextContent("72.7%");
-    expect(screen.getByText("False-positive rate").nextElementSibling).toHaveTextContent("10.0%");
-    expect(screen.getByText("Local labelled observation set A")).toBeVisible();
+    await screen.findByText("What SmartOps detected");
+    expect(screen.getAllByText("Real-world labelled validation").length).toBeGreaterThan(0);
+    expect(screen.getByRole("link", { name: "View exact Technical Evidence" })).toBeVisible();
+    expect(screen.queryByText("Local labelled observation set A")).not.toBeInTheDocument();
   });
 
   it("opens the exact alert from a valid notification deep link", async () => {
@@ -1246,7 +1239,8 @@ describe("deployment-ready SmartOps dashboard", () => {
     expect(
       await screen.findByText("Opened alert 7 from the Windows notification."),
     ).toBeVisible();
-    expect(screen.getByText("Related analytical evidence")).toBeVisible();
+    expect(screen.getByText("What happened after this alert?")).toBeVisible();
+    expect(screen.getByRole("link", { name: "Open Root-Cause Analysis" })).toHaveAttribute("href", "#/root-cause-analysis?alertId=7");
     expect(document.getElementById("alert-7")).toHaveClass("alert-card--selected");
   });
 
@@ -1556,16 +1550,11 @@ describe("deployment-ready SmartOps dashboard", () => {
     expect(screen.getByRole("heading", { name: "Loading local history" })).toBeVisible();
   });
 
-  it("applies live-history pagination through the API", async () => {
+  it("moves complete raw-history pagination to Technical Evidence", async () => {
     scenario.historyTotal = 50;
     await renderAt("#/live-monitoring");
-    const next = screen.getByRole("button", { name: "Next" });
-    expect(next).toBeEnabled();
-    await userEvent.click(next);
-    await waitFor(() => {
-      const urls = vi.mocked(fetch).mock.calls.map(([url]) => String(url));
-      expect(urls.some((url) => url.includes("offset=25"))).toBe(true);
-    });
+    expect(screen.getByRole("link", { name: /Open complete process and raw telemetry records/ })).toHaveAttribute("href", "#/technical-evidence?dataset=monitoring");
+    expect(screen.queryByRole("button", { name: "Next" })).not.toBeInTheDocument();
   });
 
   it("refreshes through the single visible control", async () => {

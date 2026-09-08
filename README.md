@@ -34,6 +34,10 @@ PowerShell terminal to stop the collector, local API, and dashboard.
   disconnected history gaps, evaluated-only band distribution, and bounded
   assessment history.
 - **PC Quality Check** compares this PC with 30 workload-specific profiles.
+- **Technical Evidence** provides optional, read-only and bounded access to raw
+  telemetry, process snapshots, analytical provenance, exact evidence and
+  versioned calculations for guides and advanced investigation. Audit Records
+  remain under Settings.
 - **Research & Validation** contains optional academic evidence and methodology.
 - **Settings** contains display, notification, privacy, diagnostics, and optional
   recalibration controls.
@@ -46,6 +50,14 @@ and static: it does not search browser history, files, typed content, or other
 personal information, and it does not write to the database. Desktop sidebar
 collapse is a browser-only preference. At smaller widths the sidebar becomes
 an accessible drawer.
+
+Ordinary alert and root-cause views use concise explanations, safe checks and
+context links. Exact decimal values, occurrence/transition history, delivery
+audit, component reconstruction and raw identifiers remain preserved in
+Technical Evidence. Alert outcomes are append-only and revisable; Research &
+Validation reports preliminary user-reviewed precision as
+`Confirmed / (Confirmed + False positive)` while full accuracy remains
+unavailable until valid true-negative and false-negative evidence exists.
 
 Health describes the current operating condition. Risk Evidence describes the
 strength of operational warning evidence. PC Quality describes workload-specific

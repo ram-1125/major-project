@@ -81,7 +81,7 @@ describe("AppShell", () => {
     const active = screen.getByRole("link", { name: "Live Monitoring" });
     expect(active).toHaveAttribute("aria-current", "page");
     expect(active.querySelector("svg")).toHaveAttribute("aria-hidden", "true");
-    expect(container.querySelectorAll(".nav-link svg")).toHaveLength(8);
+    expect(container.querySelectorAll(".nav-link svg")).toHaveLength(9);
   });
 
   it("persists desktop sidebar collapse without hiding route access", () => {

@@ -123,7 +123,7 @@ describe("RootCauseDashboard", () => {
     expect(screen.getByRole("meter", { name: "Memory Pressure evidence support" })).toHaveAttribute("aria-valuenow", "62");
     expect(screen.getByText("+18.20")).toBeVisible();
     expect(screen.getByText(/not confirmed hardware diagnoses/i)).toBeVisible();
-    expect(screen.getByRole("link", { name: /Open alert MEM-001/ })).toHaveAttribute("href", "#/predictive-alerts?alertId=88");
+    expect(screen.getByRole("link", { name: /Open related alert/ })).toHaveAttribute("href", "#/predictive-alerts?alertId=88");
   });
 
   it("filters stored summaries and shows an honest empty state", () => {
@@ -146,7 +146,7 @@ describe("RootCauseDashboard", () => {
     const { container } = renderDashboard([risk, stronger], [alert]);
     expect(screen.getAllByRole("button", { name: "View analysis" })).toHaveLength(2);
     fireEvent.change(screen.getByLabelText("Sort"), { target: { value: "evidence" } });
-    expect(container.querySelector(".investigation-card")?.textContent).toContain("Investigation #18");
+    expect(container.querySelector(".investigation-card")?.textContent).toContain("Storage Capacity Pressure");
     expect(fetchMock).not.toHaveBeenCalled();
   });
 

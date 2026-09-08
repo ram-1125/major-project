@@ -6,6 +6,7 @@ export type AppRoute =
   | "system-health"
   | "pc-quality-check"
   | "research-validation"
+  | "technical-evidence"
   | "settings";
 
 export type NavigationGroup = "monitoring" | "insights" | "application";
@@ -26,6 +27,7 @@ export const NAVIGATION_ITEMS: NavigationItem[] = [
   { route: "root-cause-analysis", label: "Root-Cause Analysis", shortLabel: "RC", description: "Alert-specific contributing evidence and diagnostic checks", group: "monitoring" },
   { route: "system-health", label: "System Health", shortLabel: "SH", description: "Current operating condition and explainable health deductions", group: "insights" },
   { route: "pc-quality-check", label: "PC Quality Check", shortLabel: "PQ", description: "Current workload headroom and separate hardware suitability", group: "insights" },
+  { route: "technical-evidence", label: "Technical Evidence", shortLabel: "TE", description: "Optional read-only telemetry, analytical provenance and exact records", group: "insights", optional: true },
   { route: "research-validation", label: "Research & Validation", shortLabel: "RV", description: "Optional labelled outcomes and method validation", group: "insights", optional: true },
 ];
 

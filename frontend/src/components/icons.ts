@@ -10,6 +10,7 @@ import {
   Expand,
   Filter,
   FlaskConical,
+  FileSearch,
   Gauge,
   HardDrive,
   HeartPulse,
@@ -38,6 +39,7 @@ export const ROUTE_ICONS: Record<AppRoute, LucideIcon> = {
   "system-health": HeartPulse,
   "pc-quality-check": BadgeCheck,
   "research-validation": FlaskConical,
+  "technical-evidence": FileSearch,
   settings: Settings,
 };
 
