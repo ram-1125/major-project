@@ -172,6 +172,31 @@ def _nvidia_inventory() -> dict[str, Any] | None:
         return None
 
 
+def _run_video_controller_json() -> list[dict[str, Any]]:
+    """Retry only the allowlisted graphics CIM query after a batch-CIM failure."""
+    executable = shutil.which("powershell.exe") or shutil.which("pwsh.exe")
+    if executable is None:
+        return []
+    script = r"""
+$ErrorActionPreference = 'Stop'
+@(Get-CimInstance Win32_VideoController |
+  Select-Object Name, AdapterRAM, DriverVersion) |
+  ConvertTo-Json -Depth 3 -Compress
+"""
+    try:
+        result = subprocess.run(
+            [executable, "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, text=True, check=True, timeout=6,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        decoded = json.loads(result.stdout.lstrip("\ufeff")) if result.stdout.strip() else []
+        if isinstance(decoded, dict):
+            return [decoded]
+        return [item for item in decoded if isinstance(item, dict)]
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        return []
+
+
 def _gpu_classification(name: str | None) -> tuple[str | None, str]:
     if not name:
         return None, "unavailable_optional"
@@ -194,6 +219,10 @@ def collect_inventory(device_id: str) -> dict[str, Any]:
     gpus = cim.get("Gpus") or []
     if isinstance(gpus, dict):
         gpus = [gpus]
+    if not gpus:
+        # One slow/failed unrelated CIM provider must not erase graphics data
+        # that Win32_VideoController can still expose independently.
+        gpus = _run_video_controller_json()
     physical_disks = cim.get("PhysicalDisks") or []
     if isinstance(physical_disks, dict):
         physical_disks = [physical_disks]
@@ -1071,7 +1100,8 @@ def evaluate_profiles(
         row = connection.execute(
             """SELECT id FROM device_inventory_snapshots
             WHERE (? IS NULL OR device_id = ?)
-            ORDER BY captured_at_utc DESC, id DESC LIMIT 1""",
+            ORDER BY COALESCE(last_checked_at_utc, captured_at_utc) DESC,
+                     id DESC LIMIT 1""",
             (device_id, device_id),
         ).fetchone()
         if row is None:
@@ -1150,7 +1180,8 @@ def quality_status(
         inventory = connection.execute(
             """SELECT * FROM device_inventory_snapshots
             WHERE (? IS NULL OR device_id = ?)
-            ORDER BY captured_at_utc DESC, id DESC LIMIT 1""",
+            ORDER BY COALESCE(last_checked_at_utc, captured_at_utc) DESC,
+                     id DESC LIMIT 1""",
             (device_id, device_id),
         ).fetchone()
         counts = {
@@ -1203,7 +1234,8 @@ def maybe_maintain_quality(database_path: Path | None = None) -> None:
     with database_connection(path) as connection:
         snapshot = connection.execute(
             """SELECT id FROM device_inventory_snapshots
-            ORDER BY captured_at_utc DESC, id DESC LIMIT 1"""
+            ORDER BY COALESCE(last_checked_at_utc, captured_at_utc) DESC,
+                     id DESC LIMIT 1"""
         ).fetchone()
         if snapshot is None:
             return

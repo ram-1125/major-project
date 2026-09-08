@@ -98,6 +98,7 @@ type Props = {
   } | null;
   alerts: OverviewAlert[];
   pipelineStatus: { generated_at_utc: string; stages: PipelineStage[] } | null;
+  workloadRangeEndUtc: string | null;
   liveState: LiveState;
   onRefresh: () => void;
   isRefreshing: boolean;
@@ -138,13 +139,25 @@ const SEVERITY_COLORS: Record<string, string> = {
 const WORKLOAD_CLASSES: Record<string, string> = {
   idle: "overview-heat--idle",
   interactive_light: "overview-heat--interactive",
-  browser_media: "overview-heat--browser",
+  browser_or_media: "overview-heat--browser",
   development: "overview-heat--development",
   guided_development: "overview-heat--guided",
   office_productivity: "overview-heat--office",
   background_activity: "overview-heat--background",
   compute_intensive: "overview-heat--compute",
-  gaming_3d: "overview-heat--gaming",
+  gaming_or_3d: "overview-heat--gaming",
+};
+
+const WORKLOAD_LABELS: Record<string, string> = {
+  idle: "Idle",
+  interactive_light: "Interactive Light",
+  browser_or_media: "Browser/Media",
+  development: "Development",
+  guided_development: "Guided Development",
+  office_productivity: "Office Productivity",
+  background_activity: "Background Activity",
+  compute_intensive: "Compute Intensive",
+  gaming_or_3d: "Gaming/3D",
 };
 
 const ACTIVITY_ICONS: Record<RecentActivityItem["kind"], LucideIcon> = {
@@ -408,8 +421,11 @@ function QualityComparison({ profiles }: { profiles: OverviewQualityProfile[] })
   );
 }
 
-function WorkloadHeatmap({ features }: { features: OverviewFeature[] }) {
-  const slots = useMemo(() => buildWorkloadHeatmap(features), [features]);
+function WorkloadHeatmap({ features, rangeEndUtc }: { features: OverviewFeature[]; rangeEndUtc: string | null }) {
+  const slots = useMemo(
+    () => buildWorkloadHeatmap(features, 288, rangeEndUtc ?? undefined),
+    [features, rangeEndUtc],
+  );
   const observed = slots.filter((slot) => slot.feature !== null).length;
   return (
     <article className="overview-panel overview-chart-card overview-chart-card--wide" aria-labelledby="workload-heatmap-title">
@@ -419,19 +435,40 @@ function WorkloadHeatmap({ features }: { features: OverviewFeature[] }) {
       </header>
       {slots.length === 0 ? <div className="overview-empty">No workload analysis period is available.</div> : <>
         <div className="overview-heatmap" role="grid" aria-label="Workload activity heatmap. Empty cells represent missing periods.">
-          {slots.map((slot) => <a
-            key={slot.timestamp_utc}
-            href={slot.feature ? "#/live-monitoring" : undefined}
-            className={`overview-heat ${slot.workload ? WORKLOAD_CLASSES[slot.workload] ?? "overview-heat--other" : "overview-heat--missing"}`}
-            aria-label={`${localTimestamp(slot.timestamp_utc)}: ${slot.workload ? words(slot.workload) : "No stored analysis period"}`}
-            title={`${localTimestamp(slot.timestamp_utc)} · ${slot.workload ? words(slot.workload) : "No stored analysis period"}`}
-            role="gridcell"
-            tabIndex={slot.feature ? 0 : -1}
-          />)}
+          {slots.map((slot) => {
+            const workloadName = slot.workload
+              ? WORKLOAD_LABELS[slot.workload] ?? `Unknown workload (${slot.workload})`
+              : slot.state === "not_evaluated" ? "Not evaluated" : "Missing";
+            const quality = slot.feature
+              ? `${slot.feature.is_complete ? "Complete" : "Incomplete"}; ${slot.feature.sample_count ?? "unknown"}/${slot.feature.expected_sample_count ?? "unknown"} samples; ${slot.feature.coverage_ratio == null ? "coverage unavailable" : `${(slot.feature.coverage_ratio * 100).toFixed(0)}% coverage`}`
+              : "No stored analysis period";
+            const confidence = slot.feature?.workload_confidence == null
+              ? "classification confidence unavailable"
+              : `${(slot.feature.workload_confidence * 100).toFixed(0)}% classification confidence`;
+            const className = slot.state === "missing"
+              ? "overview-heat--missing"
+              : slot.state === "not_evaluated"
+                ? "overview-heat--not-evaluated"
+                : WORKLOAD_CLASSES[slot.workload!] ?? "overview-heat--unknown";
+            const technical = slot.feature
+              ? `UTC ${slot.feature.window_start_utc}; feature ${slot.feature.id}; stable ID ${slot.workload}; rule ${slot.feature.workload_rule_version ?? "not recorded"}; ${slot.feature.workload_majority_explanation ?? "classification reason not recorded"}`
+              : "No feature-window record";
+            return <a
+              key={slot.timestamp_utc}
+              href={slot.feature ? `#/live-monitoring?start=${encodeURIComponent(slot.feature.window_start_utc)}&end=${encodeURIComponent(slot.feature.window_end_utc)}` : undefined}
+              className={`overview-heat ${className}`}
+              aria-label={`${localTimestamp(slot.timestamp_utc)}: ${workloadName}; ${confidence}; ${quality}`}
+              title={`${localTimestamp(slot.timestamp_utc)} · ${workloadName} · ${confidence} · ${quality} · ${technical}`}
+              role="gridcell"
+              tabIndex={slot.feature ? 0 : -1}
+            />;
+          })}
         </div>
         <div className="overview-heatmap-axis"><span>{localTimestamp(slots[0].timestamp_utc)}</span><span>5-minute periods</span><span>{localTimestamp(slots.at(-1)?.timestamp_utc)}</span></div>
         <div className="overview-heatmap-legend" aria-label="Workload colour legend">
-          {Object.entries(WORKLOAD_CLASSES).map(([name, className]) => <span key={name}><i className={className} />{words(name)}</span>)}
+          {Object.entries(WORKLOAD_CLASSES).map(([name, className]) => <span key={name}><i className={className} />{WORKLOAD_LABELS[name]}</span>)}
+          <span><i className="overview-heat--unknown" />Unknown workload</span>
+          <span><i className="overview-heat--not-evaluated" />Not evaluated</span>
           <span><i className="overview-heat--missing" />Missing</span>
         </div>
       </>}
@@ -459,7 +496,7 @@ export function OverviewDashboard(props: Props) {
   const {
     latest, totalSamples, sampleAgeMs, isStale, workload, latestHealth,
     healthHistory, latestRisk, riskReason, fineQuality,
-    alertStatus, alerts, pipelineStatus, features, liveState, onRefresh,
+    alertStatus, alerts, pipelineStatus, features, workloadRangeEndUtc, liveState, onRefresh,
     isRefreshing, baselineState,
   } = props;
   const [healthRange, setHealthRange] = useState<"1h" | "24h">("24h");
@@ -552,7 +589,7 @@ export function OverviewDashboard(props: Props) {
         <AlertDonut status={alertStatus} isStale={isStale} />
         <QualityComparison profiles={fineQuality?.profiles ?? []} />
         <ComponentComparison health={latestHealth} />
-        <WorkloadHeatmap features={features} />
+        <WorkloadHeatmap features={features} rangeEndUtc={workloadRangeEndUtc} />
       </section>
 
       <section className="overview-lower-grid">

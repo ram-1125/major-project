@@ -202,8 +202,9 @@
 .overview-heat--office { background: #31a5a0; }
 .overview-heat--background { background: #94a5b4; }
 .overview-heat--compute { background: #df963b; }
-.overview-heat--gaming { background: #d05a71; }
-.overview-heat--other { background: #637d91; }
+.overview-heat--gaming { background: #d94343; }
+.overview-heat--unknown { background: #637d91; }
+.overview-heat--not-evaluated { border-color: #c59128; background: repeating-linear-gradient(135deg, #fff5d8 0 3px, #f2d997 3px 5px); }
 .overview-heat--missing { border-color: #c8d7e2; background: repeating-linear-gradient(135deg, #f2f6f9 0 3px, #e5edf3 3px 5px); }
 .overview-heatmap-axis { display: flex; justify-content: space-between; gap: 10px; margin-top: 7px; color: var(--color-text-subtle); font-size: .63rem; }
 .overview-heatmap-legend { display: flex; flex-wrap: wrap; gap: 7px 13px; margin-top: 14px; color: var(--color-text-muted); font-size: .65rem; }

@@ -51,6 +51,7 @@ import {
   formatHeadroomScore,
   weightedDeduction,
 } from "./profileQuality";
+import { last24HourFeatureRange } from "./overviewData";
 
 const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8000";
@@ -180,6 +181,7 @@ type FeatureRow = {
   coverage_ratio: number;
   is_complete: boolean;
   dominant_workload_class: string | null;
+  workload_confidence: number | null;
   dominant_user_activity_state: string | null;
   dominant_system_activity_state: string | null;
   workload_rule_version: string | null;
@@ -201,6 +203,7 @@ type FeatureRow = {
   critical_event_count: number;
   error_event_count: number;
   warning_event_count: number;
+  finalization_state?: string | null;
 };
 
 type BaselineProfile = {
@@ -608,6 +611,23 @@ type QualityLatestResponse = {
   status: "assessed" | "provisional" | "not_evaluated";
   assessment: QualityAssessment | null;
   reason_codes: string[];
+  presentation: {
+    state: "not_observed" | "observed_evaluation_pending" | "cannot_evaluate_required_hardware_missing" | "evaluated" | "not_applicable";
+    label: string;
+    explanation: string;
+    missing_requirements: string[];
+    observation: {
+      state: "observed" | "not_observed" | "not_applicable";
+      evidence_count: number;
+      first_observed_utc: string | null;
+      last_observed_utc: string | null;
+      evidence_basis: string;
+    };
+    supporting_factor: QualityComponent | null;
+    limiting_factor: { component_name: string; explanation: string } | null;
+    evaluation_time_utc?: string | null;
+    evidence_source?: string | null;
+  };
   interpretation: string;
 };
 
@@ -1663,6 +1683,7 @@ function App() {
   const [events, setEvents] = useState<EventRow[]>([]);
   const [eventSummary, setEventSummary] = useState<EventSummary | null>(null);
   const [features, setFeatures] = useState<FeatureRow[]>([]);
+  const [overviewWorkloadRangeEnd, setOverviewWorkloadRangeEnd] = useState<string | null>(null);
   const [baseline, setBaseline] = useState<BaselineStatus | null>(null);
   const [deviation, setDeviation] = useState<DeviationLatestResponse | null>(null);
   const [deviationHistory, setDeviationHistory] = useState<DeviationAssessment[]>([]);
@@ -1876,6 +1897,7 @@ function App() {
       setRuntimeStatus(runtime);
 
       if (activeRoute === "overview") {
+        const overviewFeatureRange = last24HourFeatureRange(new Date());
         const [
           count,
           chartPage,
@@ -1906,9 +1928,11 @@ function App() {
           fetchJson<WorkloadRow | null>(requestUrl("/api/workload/latest"), signal),
           fetchJson<{ items: FeatureRow[] }>(
             requestUrl("/api/features/history", {
-              limit: 288,
+              limit: 300,
               offset: 0,
               sort: "newest",
+              start: overviewFeatureRange.start,
+              end: overviewFeatureRange.end,
             }),
             signal,
           ),
@@ -1958,6 +1982,7 @@ function App() {
         setChartHistory([...chartPage.items].reverse());
         setWorkload(latestWorkload);
         setFeatures(featurePage.items);
+        setOverviewWorkloadRangeEnd(overviewFeatureRange.end);
         setBaseline(baselineResponse);
         setRiskStatus(riskStatusResponse);
         setRisk(riskResponse);
@@ -3123,6 +3148,7 @@ function App() {
               alertStatus={alertStatus}
               alerts={alertHistory}
               pipelineStatus={pipelineStatus}
+              workloadRangeEndUtc={overviewWorkloadRangeEnd}
               liveState={chartLiveState}
               onRefresh={() => void loadMetrics()}
               isRefreshing={isRefreshing}
@@ -6159,6 +6185,23 @@ function App() {
               </div>
             ) : (
               <>
+                <div className={`quality-evaluation-state quality-evaluation-state--${quality?.presentation?.state ?? "not_observed"}`} role="status">
+                  <div>
+                    <span>Hardware suitability state</span>
+                    <strong>{quality?.presentation?.label ?? "Not observed"}</strong>
+                    <p>{quality?.presentation?.explanation ?? "No profile-specific observation or stored assessment is available."}</p>
+                  </div>
+                  <dl>
+                    <div><dt>Workload observation</dt><dd>{quality?.presentation?.observation.state === "observed" ? `Observed · ${quality.presentation.observation.evidence_count} stored evidence record${quality.presentation.observation.evidence_count === 1 ? "" : "s"}` : quality?.presentation?.observation.state === "not_applicable" ? "Not applicable" : "Not observed"}</dd></div>
+                    <div><dt>Last observed</dt><dd>{quality?.presentation?.observation.last_observed_utc ? formatTimestamp(quality.presentation.observation.last_observed_utc) : "No matching privacy-safe evidence"}</dd></div>
+                    <div><dt>Evaluation time</dt><dd>{quality?.presentation?.evaluation_time_utc ? formatTimestamp(quality.presentation.evaluation_time_utc) : "No stored evaluation"}</dd></div>
+                    <div><dt>Evidence source</dt><dd>{quality?.presentation?.evidence_source?.replaceAll("_", " ") ?? "Stored local workload and hardware evidence"}</dd></div>
+                  </dl>
+                  {(quality?.presentation?.missing_requirements.length ?? 0) > 0 && <p><strong>Required information missing:</strong> {quality!.presentation.missing_requirements.join(", ")}.</p>}
+                  {quality?.presentation?.supporting_factor && <p><strong>Main supporting factor:</strong> {quality.presentation.supporting_factor.explanation}</p>}
+                  {quality?.presentation?.limiting_factor && <p><strong>Main limiting factor:</strong> {quality.presentation.limiting_factor.explanation}</p>}
+                  <p className="quality-observation-separation">Observed use establishes relevance only. The score comes from detected hardware capability and is never assigned from workload use alone.</p>
+                </div>
                 <div className="quality-summary">
                   <article className={`quality-score quality-score--${
                     latestQuality?.evaluation_state === "assessed"
@@ -6169,7 +6212,7 @@ function App() {
                     <strong>
                       {latestQuality?.suitability_index === null
                         || latestQuality?.suitability_index === undefined
-                        ? "Not evaluated"
+                        ? quality?.presentation?.label ?? "Not evaluated"
                         : latestQuality.suitability_index.toFixed(0)}
                     </strong>
                     <p>
@@ -6179,13 +6222,13 @@ function App() {
                   </article>
                   <article>
                     <span>Evaluation state</span>
-                    <strong>{latestQuality?.evaluation_state.replaceAll("_", " ") ?? "Not evaluated"}</strong>
+                    <strong>{quality?.presentation?.label ?? latestQuality?.evaluation_state.replaceAll("_", " ") ?? "Not observed"}</strong>
                     <p>
                       {latestQuality?.evaluation_state === "provisional"
                         ? "A result is available, but an important detected capability is uncertain."
                         : latestQuality?.evaluation_state === "assessed"
                           ? "Required profile inputs were detected with sufficient reliability."
-                          : "Required profile inputs are missing or no assessment exists."}
+                          : quality?.presentation?.explanation ?? "Required profile inputs are missing or no assessment exists."}
                     </p>
                   </article>
                   <article>

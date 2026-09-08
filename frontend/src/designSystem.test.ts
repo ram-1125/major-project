@@ -39,4 +39,13 @@ describe("Stage 1 design system", () => {
     expect(css).toContain("@media (prefers-reduced-motion: reduce)");
     expect(css).toContain("animation: none");
   });
+
+  it("keeps Gaming/3D red and Background Activity grey with distinct fallbacks", () => {
+    const css = readFileSync("src/overview.css", "utf8");
+    expect(css).toContain(".overview-heat--gaming { background: #d94343; }");
+    expect(css).toContain(".overview-heat--background { background: #94a5b4; }");
+    expect(css).toContain(".overview-heat--unknown { background: #637d91; }");
+    expect(css).toContain(".overview-heat--missing");
+    expect(css).not.toContain(".overview-heat--gaming { background: #94a5b4; }");
+  });
 });

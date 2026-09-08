@@ -3758,6 +3758,17 @@ h1 {
 
 .legacy-suitability-selector h3 { margin: 0 0 5px; }
 .legacy-suitability-selector p { max-width: 700px; margin: 0; color: #5f6b76; font-size: 12px; }
+.quality-evaluation-state { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(300px, .9fr); gap: var(--space-4); border: 1px solid var(--color-border); border-left: 4px solid var(--color-primary); border-radius: var(--radius-md); padding: var(--space-4); background: var(--color-surface); }
+.quality-evaluation-state > div > span { color: var(--color-text-muted); font-size: .72rem; font-weight: 750; }
+.quality-evaluation-state > div > strong { display: block; margin: 3px 0 5px; color: var(--color-text-strong); }
+.quality-evaluation-state p { margin: 5px 0; color: var(--color-text-muted); font-size: .78rem; }
+.quality-evaluation-state dl { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin: 0; }
+.quality-evaluation-state dl div { min-width: 0; border-radius: var(--radius-sm); padding: 8px; background: var(--color-surface-subtle); }
+.quality-evaluation-state dt { color: var(--color-text-muted); font-size: .66rem; }
+.quality-evaluation-state dd { overflow-wrap: anywhere; margin: 2px 0 0; color: var(--color-text-strong); font-size: .72rem; font-weight: 700; }
+.quality-evaluation-state--cannot_evaluate_required_hardware_missing { border-left-color: var(--color-warning); }
+.quality-evaluation-state--evaluated { border-left-color: var(--color-success); }
+.quality-observation-separation { grid-column: 1 / -1; }
 
 .alert-short-basis {
   padding: 9px 11px;
@@ -4848,6 +4859,7 @@ footer {
   .technical-evidence-intro, .technical-evidence-toolbar { align-items: flex-start; flex-direction: column; }
   .technical-evidence-intro > span { margin-left: 0; }
   .outcome-choice-grid { grid-template-columns: 1fr; }
+  .quality-evaluation-state, .quality-evaluation-state dl { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 620px) {

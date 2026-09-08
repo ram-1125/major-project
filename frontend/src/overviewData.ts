@@ -22,6 +22,14 @@ export type OverviewFeature = {
   window_end_utc: string;
   dominant_workload_class: string | null;
   secondary_workload_context?: string | null;
+  workload_confidence?: number | null;
+  sample_count?: number;
+  expected_sample_count?: number;
+  coverage_ratio?: number;
+  is_complete?: boolean;
+  finalization_state?: string | null;
+  workload_rule_version?: string | null;
+  workload_majority_explanation?: string | null;
 };
 
 export type OverviewPipelineStage = {
@@ -49,6 +57,7 @@ export type WorkloadHeatmapSlot = {
   timestamp_utc: string;
   feature: OverviewFeature | null;
   workload: string | null;
+  state: "observed" | "not_evaluated" | "missing";
 };
 
 export type RecentActivityItem = {
@@ -154,28 +163,45 @@ function fiveMinuteKey(value: string): number {
 export function buildWorkloadHeatmap(
   features: OverviewFeature[],
   maximumSlots = 288,
+  rangeEndUtc?: string,
 ): WorkloadHeatmapSlot[] {
-  if (features.length === 0) return [];
+  if (features.length === 0 && !rangeEndUtc) return [];
   const map = new Map<number, OverviewFeature>();
   for (const feature of features) {
     map.set(fiveMinuteKey(feature.window_start_utc), feature);
   }
-  const earliest = Math.min(...features.map((item) => fiveMinuteKey(item.window_start_utc)));
-  const latest = Math.max(...features.map((item) => fiveMinuteKey(item.window_start_utc)));
+  const latest = rangeEndUtc
+    ? fiveMinuteKey(rangeEndUtc) - 300_000
+    : Math.max(...features.map((item) => fiveMinuteKey(item.window_start_utc)));
+  const earliest = rangeEndUtc
+    ? latest - (maximumSlots - 1) * 300_000
+    : Math.min(...features.map((item) => fiveMinuteKey(item.window_start_utc)));
   const first = Math.max(earliest, latest - (maximumSlots - 1) * 300_000);
   const slotCount = Math.min(maximumSlots, Math.floor((latest - first) / 300_000) + 1);
   return Array.from({ length: slotCount }, (_, index) => {
     const timestamp = first + index * 300_000;
     const feature = map.get(timestamp) ?? null;
+    const workload = feature?.secondary_workload_context
+      ?? feature?.dominant_workload_class
+      ?? null;
     return {
       timestamp_utc: new Date(timestamp).toISOString(),
       feature,
-      workload:
-        feature?.secondary_workload_context
-        ?? feature?.dominant_workload_class
-        ?? null,
+      workload,
+      state: feature === null ? "missing" : workload === null ? "not_evaluated" : "observed",
     };
   });
+}
+
+/** Exact UTC bounds used by the Overview's rolling 24-hour query. */
+export function last24HourFeatureRange(now: Date): { start: string; end: string } {
+  // Use only closed five-minute windows. Aligning both ends avoids labelling
+  // the two partial edge periods as missing observations.
+  const endMilliseconds = Math.floor(now.getTime() / 300_000) * 300_000;
+  return {
+    start: new Date(endMilliseconds - 24 * 60 * 60 * 1000).toISOString(),
+    end: new Date(endMilliseconds).toISOString(),
+  };
 }
 
 const PIPELINE_ACTIVITY: Record<

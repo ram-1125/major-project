@@ -100,8 +100,10 @@ from backend.phase4a_repository import (
 )
 from backend.phase4b_repository import (
     get_latest_inventory,
+    get_profile_observation,
     get_quality_assessment,
     get_quality_assessments,
+    suitability_presentation,
 )
 from backend.phase5a_repository import (
     get_alert,
@@ -1024,21 +1026,40 @@ def create_app(
         ] | None = None,
     ) -> dict[str, object]:
         with database_connection(request.app.state.database_path) as connection:
+            current_inventory = get_latest_inventory(connection, device)
+            resolved_device = device or (
+                str(current_inventory["device_id"]) if current_inventory else None
+            )
             items, _ = get_quality_assessments(
                 connection,
                 1,
                 0,
-                device_id=device,
+                device_id=resolved_device,
                 profile_key=profile,
                 suitability_result=suitability_result,
                 evaluation_state=evaluation_state,
+                inventory_snapshot_id=(
+                    int(current_inventory["id"]) if current_inventory else None
+                ),
+            )
+            assessment = items[0] if items else None
+            resolved_profile = profile or (
+                str(assessment["profile_key"]) if assessment else ""
+            )
+            observation = get_profile_observation(
+                connection, resolved_profile, resolved_device,
             )
         return {
             "status": (
-                items[0]["evaluation_state"] if items else "not_evaluated"
+                assessment["evaluation_state"] if assessment else "not_evaluated"
             ),
-            "assessment": items[0] if items else None,
+            "assessment": assessment,
             "reason_codes": [] if items else ["quality_assessment_not_run"],
+            "presentation": suitability_presentation(
+                assessment,
+                observation,
+                profile_known=resolved_profile in WORKLOAD_PROFILES,
+            ),
             "interpretation": QUALITY_INTERPRETATION,
         }
 

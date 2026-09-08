@@ -7,6 +7,165 @@ import sqlite3
 from typing import Any
 
 
+LOCAL_AI_EXECUTABLES = (
+    "ollama.exe",
+    "lm studio.exe",
+    "lmstudio.exe",
+    "llama-server.exe",
+    "koboldcpp.exe",
+    "comfyui.exe",
+)
+
+
+def get_profile_observation(
+    connection: sqlite3.Connection,
+    profile_key: str,
+    device_id: str | None = None,
+) -> dict[str, Any]:
+    """Return privacy-safe relevance evidence, separate from hardware scoring."""
+    if profile_key == "modern_3d_gaming":
+        clauses = ["dominant_workload_class = 'gaming_or_3d'"]
+        values: list[Any] = []
+        if device_id:
+            clauses.append("device_id = ?")
+            values.append(device_id)
+        row = connection.execute(
+            f"""SELECT COUNT(*) evidence_count, MIN(window_start_utc) first_observed_utc,
+            MAX(window_end_utc) last_observed_utc FROM feature_windows
+            WHERE {' AND '.join(clauses)}""",
+            values,
+        ).fetchone()
+        count = int(row["evidence_count"])
+        return {
+            "state": "observed" if count else "not_observed",
+            "evidence_count": count,
+            "first_observed_utc": row["first_observed_utc"],
+            "last_observed_utc": row["last_observed_utc"],
+            "evidence_basis": "stored_gaming_or_3d_feature_windows",
+            "rule_version": "suitability-observation-v1",
+        }
+    if profile_key == "local_ai_and_gpu_compute":
+        placeholders = ",".join("?" for _ in LOCAL_AI_EXECUTABLES)
+        device_metric = "AND metric.device_id = ?" if device_id else ""
+        parameters: list[Any] = [*LOCAL_AI_EXECUTABLES]
+        if device_id:
+            parameters.append(device_id)
+        parameters.extend(LOCAL_AI_EXECUTABLES)
+        if device_id:
+            parameters.append(device_id)
+        row = connection.execute(
+            f"""WITH evidence AS (
+              SELECT metric.timestamp_utc timestamp_utc
+              FROM metrics metric
+              WHERE LOWER(COALESCE(metric.foreground_process_name,'')) IN ({placeholders})
+                {device_metric}
+              UNION
+              SELECT metric.timestamp_utc
+              FROM process_snapshots process
+              JOIN metrics metric ON metric.id = process.metric_id
+              WHERE LOWER(process.process_name) IN ({placeholders})
+                {device_metric}
+            )
+            SELECT COUNT(*) evidence_count, MIN(timestamp_utc) first_observed_utc,
+                   MAX(timestamp_utc) last_observed_utc FROM evidence""",
+            parameters,
+        ).fetchone()
+        count = int(row["evidence_count"])
+        return {
+            "state": "observed" if count else "not_observed",
+            "evidence_count": count,
+            "first_observed_utc": row["first_observed_utc"],
+            "last_observed_utc": row["last_observed_utc"],
+            "evidence_basis": "recognized_local_ai_executable_metadata",
+            "recognized_executables": list(LOCAL_AI_EXECUTABLES),
+            "privacy_boundary": "no_commands_titles_urls_history_or_content",
+            "rule_version": "suitability-observation-v1",
+        }
+    return {
+        "state": "not_applicable",
+        "evidence_count": 0,
+        "first_observed_utc": None,
+        "last_observed_utc": None,
+        "evidence_basis": "no_profile_specific_observation_rule",
+        "rule_version": "suitability-observation-v1",
+    }
+
+
+def suitability_presentation(
+    assessment: dict[str, Any] | None,
+    observation: dict[str, Any],
+    *,
+    profile_known: bool,
+) -> dict[str, Any]:
+    """Disambiguate observation from inventory-based evaluation state."""
+    if not profile_known:
+        return {
+            "state": "not_applicable", "label": "Not applicable",
+            "explanation": "This hardware-suitability profile is not available.",
+            "missing_requirements": [], "observation": observation,
+            "supporting_factor": None, "limiting_factor": None,
+        }
+    if assessment and assessment["evaluation_state"] in {"assessed", "provisional"}:
+        supporting = next(
+            (item for item in assessment.get("components", []) if item.get("recommended_passed") is True),
+            None,
+        )
+        limiting = (assessment.get("limiting_components") or [None])[0]
+        return {
+            "state": "evaluated", "label": "Evaluated",
+            "explanation": "Genuine stored hardware inventory was evaluated for this scenario.",
+            "missing_requirements": [], "observation": observation,
+            "supporting_factor": supporting, "limiting_factor": limiting,
+            "evaluation_time_utc": assessment.get("assessed_at_utc"),
+            "evidence_source": f"hardware_inventory_snapshot_{assessment.get('inventory_snapshot_id')}",
+        }
+    if assessment:
+        missing = [
+            str(item).removesuffix("_unavailable_required").replace("_", " ")
+            for item in (assessment.get("reason_codes") or [])
+            if str(item).endswith("_unavailable_required")
+        ]
+        for component in assessment.get("components", []):
+            if component.get("detection_status") == "unavailable_required":
+                precise = [
+                    str(reason).removesuffix("_unavailable_required").replace("_", " ")
+                    for reason in component.get("reason_codes", [])
+                    if str(reason).endswith("_unavailable_required")
+                ]
+                for readable in precise or [
+                    str(component["component_name"]).replace("_", " ")
+                ]:
+                    if readable not in missing:
+                        missing.append(readable)
+        return {
+            "state": "cannot_evaluate_required_hardware_missing",
+            "label": "Cannot evaluate — required hardware information missing",
+            "explanation": (
+                "Workload observation does not substitute for the required hardware inventory."
+            ),
+            "missing_requirements": missing,
+            "observation": observation,
+            "supporting_factor": None,
+            "limiting_factor": None,
+            "evaluation_time_utc": assessment.get("assessed_at_utc"),
+            "evidence_source": f"hardware_inventory_snapshot_{assessment.get('inventory_snapshot_id')}",
+        }
+    if observation["state"] == "observed":
+        state, label = "observed_evaluation_pending", "Observed — evaluation pending"
+        explanation = "Relevant local workload evidence exists, but no hardware assessment is stored yet."
+    elif observation["state"] == "not_observed":
+        state, label = "not_observed", "Not observed"
+        explanation = "No privacy-safe stored evidence identifies this workload on this device."
+    else:
+        state, label = "not_applicable", "Not applicable"
+        explanation = "No profile-specific observation rule applies."
+    return {
+        "state": state, "label": label, "explanation": explanation,
+        "missing_requirements": [], "observation": observation,
+        "supporting_factor": None, "limiting_factor": None,
+    }
+
+
 def decode_inventory(
     connection: sqlite3.Connection,
     row: sqlite3.Row,
@@ -39,7 +198,8 @@ def get_latest_inventory(
     row = connection.execute(
         """SELECT * FROM device_inventory_snapshots
         WHERE (? IS NULL OR device_id = ?)
-        ORDER BY captured_at_utc DESC, id DESC LIMIT 1""",
+        ORDER BY COALESCE(last_checked_at_utc, captured_at_utc) DESC,
+                 id DESC LIMIT 1""",
         (device_id, device_id),
     ).fetchone()
     return decode_inventory(connection, row) if row else None
@@ -149,6 +309,7 @@ def get_quality_assessments(
     profile_key: str | None = None,
     suitability_result: str | None = None,
     evaluation_state: str | None = None,
+    inventory_snapshot_id: int | None = None,
     *,
     full: bool = True,
 ) -> tuple[list[dict[str, Any]], int]:
@@ -161,6 +322,7 @@ def get_quality_assessments(
         (profile_key, "profile_key = ?"),
         (suitability_result, "suitability_result = ?"),
         (evaluation_state, "evaluation_state = ?"),
+        (inventory_snapshot_id, "inventory_snapshot_id = ?"),
     ):
         if value is not None:
             clauses.append(clause)

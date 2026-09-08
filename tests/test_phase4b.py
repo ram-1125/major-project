@@ -24,8 +24,10 @@ from analytics.quality_catalogue import INTERPRETATION, WORKLOAD_PROFILES
 from backend.database import database_connection, initialize_database
 from backend.main import create_app
 from backend.phase4b_repository import (
+    get_profile_observation,
     get_latest_inventory,
     get_quality_assessment,
+    suitability_presentation,
 )
 from tests.test_phase4a import seed_established_upstream
 
@@ -183,6 +185,23 @@ def test_safe_inventory_uses_allowlist_and_excludes_private_identifiers(
     )
     assert media["value"] == "unknown"
     assert media["availability_status"] == "unreliable"
+
+
+def test_graphics_cim_fallback_recovers_integrated_gpu_after_batch_failure(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(quality, "_run_powershell_json", lambda: None)
+    monkeypatch.setattr(quality, "_nvidia_inventory", lambda: None)
+    monkeypatch.setattr(quality, "_run_video_controller_json", lambda: [{
+        "Name": "Intel(R) Iris(R) Xe Graphics",
+        "AdapterRAM": 2 * 1024**3,
+        "DriverVersion": "test-driver",
+    }])
+    result = collect_inventory(DEVICE)
+    fields = {item["field_name"]: item for item in result["fields"]}
+    assert fields["gpu_name"]["value"] == "Intel(R) Iris(R) Xe Graphics"
+    assert fields["gpu_classification"]["value"] == "integrated"
+    assert fields["gpu_memory_bytes"]["availability_status"] == "unreliable"
 
 
 def test_inventory_storage_reuses_unchanged_hardware_and_detects_change(
@@ -351,6 +370,157 @@ def test_integrated_gpu_is_valid_for_productivity_but_hard_limits_gpu_compute(
         gate["rule_type"] == "hard_requirement_gate"
         for gate in gpu_compute["gates"]
     )
+
+
+def test_hardware_suitability_observation_and_evaluation_states_are_separate(
+    tmp_path: Path,
+):
+    path = tmp_path / "suitability-states.db"
+    integrated = _stored(
+        path, _inventory(gpu_classification="integrated", gpu_memory_gb=2)
+    )
+    with database_connection(path) as connection, connection:
+        connection.execute(
+            """INSERT INTO feature_windows (
+            device_id,window_start_utc,window_end_utc,sample_count,
+            expected_sample_count,coverage_ratio,is_complete,
+            dominant_workload_class,missing_indicators_json,updated_at_utc
+            ) VALUES (?,?,?,10,10,1,1,'gaming_or_3d','[]',?)""",
+            (DEVICE, NOW, "2026-07-01T12:05:00+00:00", NOW),
+        )
+        gaming = get_profile_observation(connection, "modern_3d_gaming", DEVICE)
+        assessment = build_assessment(
+            connection, integrated, WORKLOAD_PROFILES["modern_3d_gaming"]
+        )
+        presentation = suitability_presentation(
+            assessment, gaming, profile_known=True
+        )
+    assert gaming["state"] == "observed"
+    assert presentation["state"] == "evaluated"
+    assert assessment["suitability_result"] == "insufficient"
+    assert assessment["suitability_index"] is not None
+    assert presentation["limiting_factor"]["component_name"] == "graphics_capability"
+
+
+def test_workload_use_never_creates_a_score_when_required_gpu_is_missing(
+    tmp_path: Path,
+):
+    path = tmp_path / "missing-gpu-observed.db"
+    missing = _stored(
+        path, _inventory(gpu_classification=None, gpu_memory_gb=None)
+    )
+    with database_connection(path) as connection, connection:
+        connection.execute(
+            """INSERT INTO feature_windows (
+            device_id,window_start_utc,window_end_utc,sample_count,
+            expected_sample_count,coverage_ratio,is_complete,
+            dominant_workload_class,missing_indicators_json,updated_at_utc
+            ) VALUES (?,?,?,10,10,1,1,'gaming_or_3d','[]',?)""",
+            (DEVICE, NOW, "2026-07-01T12:05:00+00:00", NOW),
+        )
+        observation = get_profile_observation(
+            connection, "modern_3d_gaming", DEVICE
+        )
+        assessment = build_assessment(
+            connection, missing, WORKLOAD_PROFILES["modern_3d_gaming"]
+        )
+        presentation = suitability_presentation(
+            assessment, observation, profile_known=True
+        )
+    assert observation["state"] == "observed"
+    assert assessment["suitability_index"] is None
+    assert presentation["state"] == "cannot_evaluate_required_hardware_missing"
+    assert "graphics capability" in presentation["missing_requirements"]
+
+
+def test_local_ai_cpu_only_observation_is_relevant_but_does_not_prove_gpu(
+    tmp_path: Path,
+):
+    path = tmp_path / "cpu-local-ai.db"
+    missing = _stored(
+        path, _inventory(gpu_classification=None, gpu_memory_gb=None)
+    )
+    with database_connection(path) as connection, connection:
+        connection.execute(
+            "INSERT INTO metrics (timestamp_utc,device_id,foreground_process_name) VALUES (?,?,?)",
+            (NOW, DEVICE, "Ollama.exe"),
+        )
+        observation = get_profile_observation(
+            connection, "local_ai_and_gpu_compute", DEVICE
+        )
+        assessment = build_assessment(
+            connection, missing, WORKLOAD_PROFILES["local_ai_and_gpu_compute"]
+        )
+        presentation = suitability_presentation(
+            assessment, observation, profile_known=True
+        )
+    assert observation["state"] == "observed"
+    assert presentation["state"] == "cannot_evaluate_required_hardware_missing"
+    assert assessment["suitability_index"] is None
+
+
+def test_unobserved_gpu_profile_can_still_receive_hardware_only_evaluation(
+    tmp_path: Path,
+):
+    path = tmp_path / "unobserved-gpu.db"
+    dedicated = _stored(path, _inventory())
+    with database_connection(path) as connection:
+        observation = get_profile_observation(
+            connection, "local_ai_and_gpu_compute", DEVICE
+        )
+        assessment = build_assessment(
+            connection, dedicated, WORKLOAD_PROFILES["local_ai_and_gpu_compute"]
+        )
+        presentation = suitability_presentation(
+            assessment, observation, profile_known=True
+        )
+    assert observation["state"] == "not_observed"
+    assert presentation["state"] == "evaluated"
+    assert assessment["suitability_index"] is not None
+
+
+def test_dedicated_gpu_without_vram_is_precisely_not_evaluable(tmp_path: Path):
+    path = tmp_path / "missing-vram.db"
+    inventory = _stored(
+        path,
+        _inventory(
+            gpu_classification="dedicated",
+            gpu_memory_gb=None,
+            gpu_memory_status="unavailable_optional",
+        ),
+    )
+    with database_connection(path) as connection:
+        assessment = build_assessment(
+            connection, inventory, WORKLOAD_PROFILES["modern_3d_gaming"]
+        )
+        presentation = suitability_presentation(
+            assessment,
+            get_profile_observation(connection, "modern_3d_gaming", DEVICE),
+            profile_known=True,
+        )
+    assert assessment["evaluation_state"] == "not_evaluated"
+    assert assessment["suitability_index"] is None
+    assert presentation["state"] == "cannot_evaluate_required_hardware_missing"
+    assert "gpu memory" in presentation["missing_requirements"]
+
+
+@pytest.mark.parametrize("profile_key", [
+    "modern_3d_gaming",
+    "local_ai_and_gpu_compute",
+])
+def test_complete_dedicated_gpu_evidence_evaluates_stable_profile_ids(
+    tmp_path: Path,
+    profile_key: str,
+):
+    path = tmp_path / f"{profile_key}.db"
+    inventory = _stored(path, _inventory())
+    with database_connection(path) as connection:
+        assessment = build_assessment(
+            connection, inventory, WORKLOAD_PROFILES[profile_key]
+        )
+    assert assessment["profile_key"] == profile_key
+    assert assessment["evaluation_state"] == "assessed"
+    assert assessment["suitability_index"] is not None
 
 
 def test_unreliable_dedicated_gpu_memory_makes_assessment_provisional(
@@ -593,6 +763,7 @@ def test_quality_api_filters_pagination_and_get_requests_do_not_evaluate(
     assert responses["latest"].json()["assessment"]["profile_key"] == (
         "software_development"
     )
+    assert responses["latest"].json()["presentation"]["state"] == "evaluated"
     assert responses["history"].json()["total"] == 6
     assert len(responses["history"].json()["items"]) == 2
     assert responses["count"].json() == {"count": 6}
@@ -600,6 +771,48 @@ def test_quality_api_filters_pagination_and_get_requests_do_not_evaluate(
     assert responses["legacy"].json()["status"] == "ok"
     assert too_large.status_code == 422
     assert before == after
+
+
+def test_latest_quality_follows_last_verified_inventory_not_original_capture_time(
+    tmp_path: Path,
+):
+    path = tmp_path / "inventory-recency.db"
+    initialize_database(path)
+    valid = _inventory(signature="valid", gpu_classification="integrated", gpu_memory_gb=2)
+    valid["captured_at_utc"] = "2026-07-01T00:00:00+00:00"
+    with database_connection(path) as connection:
+        valid_id, _ = store_inventory(connection, valid)
+    evaluate_profiles(path, force=True)
+
+    unavailable = _inventory(
+        signature="temporary-cim-failure",
+        gpu_classification=None,
+        gpu_memory_gb=None,
+    )
+    unavailable["captured_at_utc"] = "2026-07-02T00:00:00+00:00"
+    with database_connection(path) as connection:
+        unavailable_id, _ = store_inventory(connection, unavailable)
+    evaluate_profiles(path, force=True)
+
+    verified_again = copy.deepcopy(valid)
+    verified_again["captured_at_utc"] = "2026-07-03T00:00:00+00:00"
+    with database_connection(path) as connection:
+        reused_id, reused = store_inventory(connection, verified_again)
+        latest = get_latest_inventory(connection, DEVICE)
+
+    assert reused is True
+    assert reused_id == valid_id
+    assert latest["id"] == valid_id
+    assert latest["id"] != unavailable_id
+    with TestClient(create_app(path)) as client:
+        for profile in ("modern_3d_gaming", "local_ai_and_gpu_compute"):
+            response = client.get("/api/quality/latest", params={"profile": profile})
+            assert response.status_code == 200
+            body = response.json()
+            assert body["assessment"]["inventory_snapshot_id"] == valid_id
+            assert body["assessment"]["evaluation_state"] == "assessed"
+            assert body["assessment"]["suitability_index"] is not None
+            assert body["presentation"]["state"] == "evaluated"
 
 
 def test_recommendations_are_generic_and_not_commercial_products(tmp_path: Path):

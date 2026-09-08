@@ -5,6 +5,7 @@ import {
   buildRecentActivity,
   buildWorkloadHeatmap,
   healthTone,
+  last24HourFeatureRange,
   pipelineTone,
   selectQualityProfiles,
 } from "./overviewData";
@@ -37,6 +38,35 @@ describe("Overview genuine-data shaping", () => {
     ], 3);
     expect(slots.map((slot) => slot.workload)).toEqual(["development", null, "guided_development"]);
     expect(slots[1].feature).toBeNull();
+    expect(slots[1].state).toBe("missing");
+  });
+
+  it("uses stable workload identifiers and keeps an exact chronological 24-hour grid", () => {
+    const end = "2026-09-08T16:03:12.000Z";
+    const slots = buildWorkloadHeatmap([
+      { id: 9, window_start_utc: "2026-09-08T15:55:00Z", window_end_utc: "2026-09-08T16:00:00Z", dominant_workload_class: "gaming_or_3d" },
+      { id: 8, window_start_utc: "2026-09-08T15:50:00Z", window_end_utc: "2026-09-08T15:55:00Z", dominant_workload_class: "background_activity" },
+    ], 288, end);
+    expect(slots).toHaveLength(288);
+    expect(slots.at(-2)?.workload).toBe("background_activity");
+    expect(slots.at(-1)?.workload).toBe("gaming_or_3d");
+    expect(slots[0].timestamp_utc < slots.at(-1)!.timestamp_utc).toBe(true);
+    expect(slots[0].state).toBe("missing");
+    expect(last24HourFeatureRange(new Date(end))).toEqual({
+      start: "2026-09-07T16:00:00.000Z",
+      end: "2026-09-08T16:00:00.000Z",
+    });
+  });
+
+  it("distinguishes a stored not-evaluated period from a missing period", () => {
+    const slots = buildWorkloadHeatmap([{
+      id: 10,
+      window_start_utc: "2026-09-08T15:55:00Z",
+      window_end_utc: "2026-09-08T16:00:00Z",
+      dominant_workload_class: null,
+    }], 2, "2026-09-08T16:03:12.000Z");
+    expect(slots[0].state).toBe("missing");
+    expect(slots[1].state).toBe("not_evaluated");
   });
 
   it("projects recent activity from genuine source timestamps only", () => {

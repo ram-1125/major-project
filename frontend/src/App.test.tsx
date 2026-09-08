@@ -249,6 +249,8 @@ type Scenario = {
   candidate?: boolean;
   fineQualityUnavailable?: boolean;
   pipelineState?: "processing" | "successfully_waiting" | "failed" | "overdue" | "not_applicable";
+  features?: Array<Record<string, any>>;
+  hardwareQualityResponse?: Record<string, any>;
 };
 
 let scenario: Scenario;
@@ -442,7 +444,7 @@ function responseFor(input: RequestInfo | URL, init?: RequestInit) {
   }
   if (path === "/api/features/history") {
     return ok({
-      items: [{
+      items: scenario.features ?? [{
         id: 4,
         window_start_utc: "2026-07-26T09:55:00Z",
         window_end_utc: timestamp,
@@ -612,17 +614,18 @@ function responseFor(input: RequestInfo | URL, init?: RequestInit) {
   }
   if (path === "/api/quality/profiles") {
     return ok({
-      profiles: [{
-        key: "software_development",
-        name: "Software Development",
-        description: "Development workload",
-        intended_workload: "development",
-        profile_version: "4b",
-        configuration_version: "4b",
-        catalogue_version: "4b",
-        components: {},
-        limitations: [],
-      }],
+      profiles: [
+        ["general_everyday_use", "General Everyday Use"],
+        ["software_development", "Software Development"],
+        ["data_analysis_and_light_ml", "Data Analysis and Light ML"],
+        ["local_ai_and_gpu_compute", "Local AI and GPU Compute"],
+        ["content_creation", "Content Creation"],
+        ["modern_3d_gaming", "Modern 3D Gaming"],
+      ].map(([key, name]) => ({
+        key, name, description: `${name} workload`, intended_workload: key,
+        profile_version: "4b", configuration_version: "4b", catalogue_version: "4b",
+        components: {}, limitations: [],
+      })),
     });
   }
   if (path === "/api/quality/inventory/latest") {
@@ -650,10 +653,30 @@ function responseFor(input: RequestInfo | URL, init?: RequestInit) {
     });
   }
   if (path === "/api/quality/latest") {
+    if (scenario.hardwareQualityResponse) return ok(scenario.hardwareQualityResponse);
     return ok({
       status: scenario.quality ? "assessed" : "not_evaluated",
       assessment: scenario.quality ?? null,
       reason_codes: scenario.quality ? [] : ["not_run"],
+      presentation: scenario.quality ? {
+        state: "evaluated",
+        label: "Evaluated",
+        explanation: "Genuine stored hardware inventory was evaluated for this scenario.",
+        missing_requirements: [],
+        observation: { state: "not_applicable", evidence_count: 0, first_observed_utc: null, last_observed_utc: null, evidence_basis: "no_profile_specific_observation_rule" },
+        supporting_factor: null,
+        limiting_factor: null,
+        evaluation_time_utc: timestamp,
+        evidence_source: "hardware_inventory_snapshot_1",
+      } : {
+        state: "not_observed",
+        label: "Not observed",
+        explanation: "No privacy-safe stored evidence identifies this workload on this device.",
+        missing_requirements: [],
+        observation: { state: "not_observed", evidence_count: 0, first_observed_utc: null, last_observed_utc: null, evidence_basis: "stored_local_evidence" },
+        supporting_factor: null,
+        limiting_factor: null,
+      },
       interpretation: "Suitability is not current health.",
     });
   }
@@ -958,6 +981,61 @@ describe("deployment-ready SmartOps dashboard", () => {
     expect(screen.getByRole("img", { name: /1 active alerts.*Elevated 1/i })).toBeVisible();
     expect(screen.getByText("Alert observed: Sustained CPU pressure")).toBeVisible();
     expect(screen.getByText("View all 30 workload profiles")).toBeVisible();
+  });
+
+  it("maps authoritative workload IDs to distinct accessible heatmap cells", async () => {
+    const bucket = Math.floor(Date.now() / 300_000) * 300_000;
+    const feature = (id: number, minutesBack: number, workload: string | null) => ({
+      id,
+      window_start_utc: new Date(bucket - minutesBack * 60_000).toISOString(),
+      window_end_utc: new Date(bucket - (minutesBack - 5) * 60_000).toISOString(),
+      sample_count: 10,
+      expected_sample_count: 10,
+      coverage_ratio: 1,
+      is_complete: true,
+      dominant_workload_class: workload,
+      secondary_workload_context: null,
+      workload_confidence: workload ? 0.98 : null,
+      workload_rule_version: "phase7b1-workload-v3",
+      workload_majority_explanation: workload ? `Stored ${workload} majority.` : "Required classification unavailable.",
+      dominant_user_activity_state: workload ? "active" : null,
+      dominant_system_activity_state: "background",
+      cpu_avg: 42,
+      ram_avg: 61,
+      critical_event_count: 0,
+      error_event_count: 0,
+      warning_event_count: 0,
+    });
+    scenario.features = [
+      feature(90, 20, "background_activity"),
+      feature(91, 15, "gaming_or_3d"),
+      feature(92, 10, "future_workload_id"),
+      feature(93, 5, null),
+    ];
+    await renderAt("#/overview");
+
+    const gaming = screen.getByRole("gridcell", { name: /Gaming\/3D; 98% classification confidence; Complete; 10\/10 samples; 100% coverage/i });
+    const background = screen.getByRole("gridcell", { name: /Background Activity; 98% classification confidence/i });
+    const unknown = screen.getByRole("gridcell", { name: /Unknown workload \(future_workload_id\)/i });
+    const notEvaluated = screen.getByRole("gridcell", { name: /Not evaluated; classification confidence unavailable/i });
+    const missing = screen.getAllByRole("gridcell", { name: /Missing; classification confidence unavailable/i })[0];
+
+    expect(gaming).toHaveClass("overview-heat--gaming");
+    expect(background).toHaveClass("overview-heat--background");
+    expect(gaming.className).not.toBe(background.className);
+    expect(unknown).toHaveClass("overview-heat--unknown");
+    expect(notEvaluated).toHaveClass("overview-heat--not-evaluated");
+    expect(missing).toHaveClass("overview-heat--missing");
+    expect(missing).not.toHaveClass("overview-heat--background");
+    expect(gaming).toHaveAttribute("title", expect.stringContaining("feature 91; stable ID gaming_or_3d; rule phase7b1-workload-v3"));
+    expect(screen.getByText("Gaming/3D", { selector: ".overview-heatmap-legend span" })).toBeVisible();
+    expect(screen.getByText("Background Activity", { selector: ".overview-heatmap-legend span" })).toBeVisible();
+
+    const featureRequest = vi.mocked(fetch).mock.calls
+      .map(([url]) => new URL(String(url)))
+      .find((url) => url.pathname === "/api/features/history")!;
+    expect(Date.parse(featureRequest.searchParams.get("end")!) - Date.parse(featureRequest.searchParams.get("start")!))
+      .toBe(24 * 60 * 60 * 1000);
   });
 
   it("shows an honest neutral alert-distribution state when no alert exists", async () => {
@@ -1499,6 +1577,68 @@ describe("deployment-ready SmartOps dashboard", () => {
     expect(screen.getByRole("heading", { name: "Hardware Workload Suitability" })).toBeVisible();
     expect(screen.getByRole("heading", { name: "Previous quality-check history" })).toBeVisible();
     expect(screen.getAllByText("Software Development").length).toBeGreaterThan(0);
+  });
+
+  it("keeps workload observation separate from an evaluated integrated-GPU result", async () => {
+    scenario.hardwareQualityResponse = {
+      status: "assessed",
+      assessment: {
+        ...qualityAssessment,
+        profile_key: "modern_3d_gaming",
+        profile_name: "Modern 3D Gaming",
+        suitability_index: 39,
+        suitability_result: "insufficient",
+        explanation: "The integrated graphics adapter does not meet the dedicated-GPU requirement.",
+      },
+      reason_codes: [],
+      presentation: {
+        state: "evaluated",
+        label: "Evaluated",
+        explanation: "Genuine stored hardware inventory was evaluated for this scenario.",
+        missing_requirements: [],
+        observation: { state: "observed", evidence_count: 48, first_observed_utc: timestamp, last_observed_utc: timestamp, evidence_basis: "stored_gaming_or_3d_feature_windows" },
+        supporting_factor: { explanation: "The 64-bit operating system requirement is met." },
+        limiting_factor: { component_name: "graphics_capability", explanation: "A dedicated graphics adapter is required; the detected adapter is integrated." },
+        evaluation_time_utc: timestamp,
+        evidence_source: "hardware_inventory_snapshot_3",
+      },
+      interpretation: "Suitability is not current health.",
+    };
+    await renderAt("#/pc-quality-check");
+    await userEvent.selectOptions(screen.getByRole("combobox", { name: "Hardware scenario" }), "modern_3d_gaming");
+    const state = document.querySelector(".quality-evaluation-state") as HTMLElement;
+    expect(state).toHaveTextContent("Evaluated");
+    expect(state).toHaveTextContent("Observed · 48 stored evidence records");
+    expect(state).toHaveTextContent("dedicated graphics adapter is required");
+    expect(state).toHaveTextContent("Observed use establishes relevance only");
+    expect(screen.getByRole("combobox", { name: "Hardware scenario" })).toHaveValue("modern_3d_gaming");
+  });
+
+  it("shows the exact required hardware gap without manufacturing a score", async () => {
+    scenario.hardwareQualityResponse = {
+      status: "not_evaluated",
+      assessment: { ...qualityAssessment, profile_key: "local_ai_and_gpu_compute", profile_name: "Local AI and GPU Compute", suitability_index: null, suitability_result: "not_evaluated", evaluation_state: "not_evaluated" },
+      reason_codes: [],
+      presentation: {
+        state: "cannot_evaluate_required_hardware_missing",
+        label: "Cannot evaluate — required hardware information missing",
+        explanation: "Workload observation does not substitute for the required hardware inventory.",
+        missing_requirements: ["gpu memory"],
+        observation: { state: "observed", evidence_count: 2, first_observed_utc: timestamp, last_observed_utc: timestamp, evidence_basis: "recognized_local_ai_executable_metadata" },
+        supporting_factor: null,
+        limiting_factor: null,
+        evaluation_time_utc: timestamp,
+        evidence_source: "hardware_inventory_snapshot_3",
+      },
+      interpretation: "Suitability is not current health.",
+    };
+    await renderAt("#/pc-quality-check");
+    await userEvent.selectOptions(screen.getByRole("combobox", { name: "Hardware scenario" }), "local_ai_and_gpu_compute");
+    const state = document.querySelector(".quality-evaluation-state") as HTMLElement;
+    expect(state).toHaveTextContent("Cannot evaluate — required hardware information missing");
+    expect(state).toHaveTextContent("Required information missing: gpu memory");
+    expect(state).toHaveTextContent("Observed · 2 stored evidence records");
+    expect(state).not.toHaveTextContent(/100/);
   });
 
   it("never substitutes legacy hardware suitability for Device headroom", async () => {
