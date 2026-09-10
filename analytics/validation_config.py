@@ -11,9 +11,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
-ALGORITHM_VERSION = "validation-v1"
-CONFIGURATION_VERSION = "phase5b-v1"
-MATCHING_VERSION = "incident-matching-v1"
+ALGORITHM_VERSION = "validation-v2"
+CONFIGURATION_VERSION = "automatic-labelled-evidence-v2.1"
+MATCHING_VERSION = "incident-matching-v2"
 
 INTERPRETATION = (
     "SmartOps validation results are based on available user-reported or "
@@ -61,8 +61,9 @@ MATCH_TYPES = (
     "unmatched",
 )
 
-# Phase 5A alert categories are intentionally mapped broadly. Automatic
-# matching only proposes a candidate; it can never create a confirmed match.
+# Phase 5A alert categories are intentionally mapped broadly.  A match remains
+# a temporal evidence association rather than proof that an alert caused an
+# incident.
 CATEGORY_COMPATIBILITY = {
     "application_instability": {"application_failure", "severe_slowdown"},
     "unexpected_interruption": {"system_crash", "unexpected_restart"},
@@ -111,13 +112,41 @@ CATEGORY_COMPATIBILITY = {
     "data_quality_limitation": set(),
 }
 
+# Warning horizons are transparent SmartOps engineering policies, not learned
+# probabilities.  They bound how far before an incident an alert can qualify.
+CATEGORY_WARNING_HORIZONS_SECONDS = {
+    "application_instability": 2 * 60 * 60,
+    "unexpected_interruption": 6 * 60 * 60,
+    "storage_pressure": 6 * 60 * 60,
+    "memory_pressure": 2 * 60 * 60,
+    "thermal_pressure": 2 * 60 * 60,
+    "power_instability": 6 * 60 * 60,
+    "network_pressure": 60 * 60,
+    "resource_pressure": 2 * 60 * 60,
+    "degraded_system_health": 2 * 60 * 60,
+    "increasing_risk_evidence": 6 * 60 * 60,
+    "memory_and_swap_pressure": 2 * 60 * 60,
+    "disk_capacity_pressure": 6 * 60 * 60,
+    "disk_io_pressure": 6 * 60 * 60,
+    "thermal_evidence": 2 * 60 * 60,
+    "repeated_serious_event": 6 * 60 * 60,
+    "system_stability": 6 * 60 * 60,
+}
+
+MATURITY_LEVELS = (
+    # label, minimum positive incident units, minimum negative units, days
+    ("stronger_evidence", 50, 50, 14),
+    ("moderate_evidence", 20, 20, 7),
+    ("preliminary", 1, 1, 1),
+)
+
 
 @dataclass(frozen=True)
 class ValidationPolicy:
     """Versioned evidence and publication requirements."""
 
     minimum_window_coverage: float = 0.8
-    minimum_no_issue_horizon_seconds: float = 24 * 60 * 60
+    minimum_no_issue_horizon_seconds: float = 60 * 60
     matching_lookback_seconds: float = 24 * 60 * 60
     matching_late_seconds: float = 60 * 60
     probable_match_score: float = 0.70
@@ -128,6 +157,8 @@ class ValidationPolicy:
     minimum_accuracy_distinct_days: int = 7
     minimum_accuracy_period_seconds: float = 7 * 24 * 60 * 60
     minimum_lead_time_matches: int = 5
+    incident_monitoring_lookback_seconds: float = 15 * 60
+    minimum_incident_monitoring_coverage: float = 0.8
 
 
 DEFAULT_POLICY = ValidationPolicy()

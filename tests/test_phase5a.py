@@ -150,7 +150,7 @@ def test_schema7_migration_preserves_existing_records(tmp_path: Path):
         connection.execute("PRAGMA user_version = 7")
     initialize_database(path)
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 18
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 19
         assert connection.execute("SELECT COUNT(*) FROM metrics").fetchone()[0] == 1
         tables = {
             row[0]

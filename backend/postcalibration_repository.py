@@ -1,4 +1,4 @@
-"""Schema 18 persistence for permanent post-calibration features.
+"""Schema 18/19 persistence for permanent post-calibration features.
 
 The tables in this module are additive.  They never modify baseline statistics,
 historical workload labels, alert severity, or Phase 7B shadow evidence.
@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from typing import Any, Mapping
 
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 
 SCHEMA_STATEMENTS = (
     """CREATE TABLE IF NOT EXISTS fine_quality_observations (
@@ -182,6 +182,25 @@ SCHEMA_STATEMENTS = (
         updated_at_utc TEXT NOT NULL,
         CHECK(current_state IN ('processing','successfully_waiting','overdue','failed','not_applicable','not_yet_executed'))
     )""",
+    """CREATE TABLE IF NOT EXISTS validation_match_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        link_id INTEGER,
+        alert_id INTEGER,
+        incident_id INTEGER NOT NULL,
+        previous_decision TEXT,
+        new_decision TEXT NOT NULL,
+        decision_basis_json TEXT NOT NULL,
+        warning_horizon_seconds REAL,
+        matching_score REAL,
+        decision_signature TEXT NOT NULL,
+        method_version TEXT NOT NULL,
+        event_timestamp_utc TEXT NOT NULL,
+        created_at_utc TEXT NOT NULL,
+        FOREIGN KEY(link_id) REFERENCES alert_incident_links(id),
+        FOREIGN KEY(alert_id) REFERENCES alerts(id),
+        FOREIGN KEY(incident_id) REFERENCES incident_reports(id),
+        UNIQUE(incident_id, alert_id, method_version, decision_signature)
+    )""",
 )
 
 INDEX_STATEMENTS = (
@@ -191,6 +210,8 @@ INDEX_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS idx_alert_snapshot_alert ON alert_explanation_snapshots(alert_id, created_at_utc DESC)",
     "CREATE INDEX IF NOT EXISTS idx_validation_registry_rule ON validation_registry(rule_identifier, rule_version, applicable_workload_scope)",
     "CREATE INDEX IF NOT EXISTS idx_alert_outcome_occurrence_time ON alert_outcome_events(alert_occurrence_id, event_timestamp_utc DESC, id DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_validation_match_incident_time ON validation_match_events(incident_id, event_timestamp_utc DESC, id DESC)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_validation_match_decision_unique ON validation_match_events(incident_id, IFNULL(alert_id, -1), method_version, decision_signature)",
 )
 
 PIPELINE_STAGES = {

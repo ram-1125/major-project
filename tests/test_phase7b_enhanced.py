@@ -294,7 +294,7 @@ def test_schema10_migrates_to_schema11_without_data_loss(tmp_path: Path):
                 WHERE type = 'table' AND name LIKE 'enhanced_%'"""
             )
         }
-    assert version == 18
+    assert version == 19
     assert preserved == 1
     assert len(enhanced_tables) == 6
 

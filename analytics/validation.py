@@ -10,6 +10,7 @@ import argparse
 import hashlib
 import json
 import sqlite3
+import math
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,14 +20,17 @@ from agent.config import get_database_path
 from analytics.validation_config import (
     ALGORITHM_VERSION,
     CATEGORY_COMPATIBILITY,
+    CATEGORY_WARNING_HORIZONS_SECONDS,
     CONFIGURATION_VERSION,
     DEFAULT_POLICY,
     INTERPRETATION,
     MATCHING_VERSION,
+    MATURITY_LEVELS,
     ValidationPolicy,
 )
 from backend.database import database_connection, initialize_database
 from backend.phase5b_repository import (
+    append_match_event,
     dumps,
     expand,
     list_incidents,
@@ -76,7 +80,13 @@ def _signature(connection: sqlite3.Connection, device: str | None) -> str:
         (
             "validation_observation_periods",
             "id, device_id, start_utc, end_utc, state, "
-            "incident_reporting_complete, coverage_ratio, updated_at_utc",
+            "incident_reporting_complete, coverage_ratio, declared_outcome, "
+            "related_incident_id, eligibility_state, updated_at_utc",
+        ),
+        (
+            "alert_outcome_events",
+            "id, alert_occurrence_id, previous_outcome, new_outcome, "
+            "event_timestamp_utc, audit_reason",
         ),
         (
             "alert_incident_links",
@@ -111,16 +121,12 @@ def _automatic_matches(
     end: str | None,
     policy: ValidationPolicy,
 ) -> int:
-    alerts = [
-        dict(row)
-        for row in connection.execute(
-            """SELECT id, device_id, category, evidence_domain,
-            first_observed_utc, workload_context, consecutive_window_count
-            FROM alerts WHERE (? IS NULL OR device_id = ?)""",
-            (device, device),
-        )
-        if _in_range(row["first_observed_utc"], start, end)
-    ]
+    alerts = [dict(row) for row in connection.execute(
+        """SELECT id, device_id, category, evidence_domain,
+        first_observed_utc, workload_context, consecutive_window_count
+        FROM alerts WHERE (? IS NULL OR device_id = ?)""",
+        (device, device),
+    )]
     incidents = [
         dict(row)
         for row in connection.execute(
@@ -133,11 +139,22 @@ def _automatic_matches(
         if _in_range(row["start_utc"], start, end)
     ]
     created = 0
-    for alert in alerts:
-        alert_time = _parse(alert["first_observed_utc"])
-        compatible = CATEGORY_COMPATIBILITY.get(alert["category"], set())
-        for incident in incidents:
+    for incident in incidents:
+        candidates: list[dict[str, Any]] = []
+        incident_time = _parse(incident["start_utc"])
+        for alert in alerts:
             if incident["device_id"] != alert["device_id"]:
+                continue
+            alert_time = _parse(alert["first_observed_utc"])
+            compatible = CATEGORY_COMPATIBILITY.get(alert["category"], set())
+            horizon = CATEGORY_WARNING_HORIZONS_SECONDS.get(
+                alert["category"], policy.matching_lookback_seconds
+            )
+            difference = (incident_time - alert_time).total_seconds()
+            if difference < 0 or difference > horizon:
+                continue
+            category_match = incident["category"] in compatible
+            if not category_match:
                 continue
             existing = connection.execute(
                 """SELECT origin FROM alert_incident_links
@@ -146,19 +163,9 @@ def _automatic_matches(
             ).fetchone()
             if existing and existing["origin"] == "manual":
                 continue
-            difference = (_parse(incident["start_utc"]) - alert_time).total_seconds()
-            if not (
-                -policy.matching_late_seconds
-                <= difference
-                <= policy.matching_lookback_seconds
-            ):
-                continue
-            category_match = incident["category"] in compatible
             time_score = max(
                 0.0,
-                1.0
-                - abs(difference)
-                / max(policy.matching_lookback_seconds, policy.matching_late_seconds),
+                1.0 - difference / horizon,
             )
             workload_match = bool(
                 alert["workload_context"]
@@ -190,12 +197,44 @@ def _automatic_matches(
                 + (0.10 if event_match else 0.0)
                 + (0.05 if persistence_support else 0.0),
             )
-            if score >= policy.probable_match_score:
-                match_type = "probable_match"
-            elif score >= policy.possible_match_score:
-                match_type = "possible_match"
-            else:
-                match_type = "rejected_match"
+            if score >= policy.possible_match_score:
+                candidates.append({
+                    "alert": alert,
+                    "difference": difference,
+                    "horizon": horizon,
+                    "score": round(score, 6),
+                    "workload_match": workload_match,
+                    "event_match": event_match,
+                    "persistence_support": persistence_support,
+                })
+
+        # A single compatible candidate is deterministic. Multiple candidates
+        # remain proposals for a simple user decision; time proximity alone
+        # must not be presented as proof of causation.
+        candidates.sort(key=lambda item: (-item["score"], item["difference"], item["alert"]["id"]))
+        uniquely_determined = len(candidates) == 1
+        if not candidates:
+            append_match_event(
+                connection,
+                incident_id=incident["id"], alert_id=None, link_id=None,
+                previous_decision=None,
+                new_decision="no_qualifying_preceding_alert",
+                decision_basis={
+                    "device_match_required": True,
+                    "category_compatibility_required": True,
+                    "preceding_alert_required": True,
+                    "result": "potential_false_negative_subject_to_monitoring_eligibility",
+                },
+                warning_horizon_seconds=None, matching_score=None,
+                method_version=MATCHING_VERSION,
+            )
+            continue
+        for candidate in candidates:
+            alert = candidate["alert"]
+            match_type = "confirmed_match" if uniquely_determined else (
+                "probable_match" if candidate["score"] >= policy.probable_match_score
+                else "possible_match"
+            )
             upsert_alert_incident_link(
                 connection,
                 alert_id=alert["id"],
@@ -203,25 +242,50 @@ def _automatic_matches(
                 match_type=match_type,
                 origin="automatic",
                 confirmed_by_user=False,
-                matching_score=round(score, 6),
-                time_difference_seconds=difference,
-                category_compatible=category_match,
-                matching_rule="category_time_workload_v1",
+                matching_score=candidate["score"],
+                time_difference_seconds=candidate["difference"],
+                category_compatible=True,
+                matching_rule="unique_category_time_workload_v2",
                 supporting_evidence=[
                     value
                     for value, present in (
-                        ("compatible_category", category_match),
+                        ("compatible_category", True),
                         ("within_matching_horizon", True),
-                        ("same_workload_context", workload_match),
-                        ("linked_windows_event", event_match),
-                        ("persistent_alert_evidence", persistence_support),
+                        ("same_workload_context", candidate["workload_match"]),
+                        ("linked_windows_event", candidate["event_match"]),
+                        ("persistent_alert_evidence", candidate["persistence_support"]),
                     )
                     if present
                 ],
-                contradictory_evidence=(
-                    [] if category_match else ["category_not_explicitly_compatible"]
+                contradictory_evidence=[],
+                reason_codes=(
+                    ["unique_deterministic_temporal_match", "temporal_match_not_causation"]
+                    if uniquely_determined
+                    else ["ambiguous_match_requires_user_confirmation"]
                 ),
-                reason_codes=["automatic_candidate_not_confirmed"],
+            )
+            link = connection.execute(
+                """SELECT id FROM alert_incident_links WHERE alert_id = ?
+                AND incident_id = ? AND matching_version = ?""",
+                (alert["id"], incident["id"], MATCHING_VERSION),
+            ).fetchone()
+            append_match_event(
+                connection,
+                incident_id=incident["id"], alert_id=alert["id"],
+                link_id=int(link["id"]) if link else None,
+                previous_decision=None,
+                new_decision=("accepted_unique_match" if uniquely_determined else "proposed_ambiguous_match"),
+                decision_basis={
+                    "alert_category": alert["category"],
+                    "incident_category": incident["category"],
+                    "time_difference_seconds": candidate["difference"],
+                    "workload_match": candidate["workload_match"],
+                    "candidate_count": len(candidates),
+                    "causation_claimed": False,
+                },
+                warning_horizon_seconds=candidate["horizon"],
+                matching_score=candidate["score"],
+                method_version=MATCHING_VERSION,
             )
             created += 1
     return created
@@ -236,7 +300,7 @@ def _metric(
     confidence: float,
     reconstruction: dict[str, Any],
 ) -> dict[str, Any]:
-    enough = denominator >= minimum
+    enough = denominator > 0
     value = (
         round(float(numerator or 0) / denominator, 6)
         if enough and denominator > 0
@@ -253,12 +317,53 @@ def _metric(
         "data_confidence": round(confidence, 6),
         "minimum_requirement": minimum,
         "reason_codes": (
-            []
-            if value is not None
-            else [f"minimum_{name}_evidence_not_met"]
+            [] if value is not None else [f"{name}_denominator_is_zero"]
         ),
         "reconstruction": reconstruction,
+        "confidence_interval_lower": None,
+        "confidence_interval_upper": None,
+        "confidence_interval_method": None,
+        "maturity_label": "preliminary" if value is not None else "insufficient",
     }
+
+
+def _wilson_interval(successes: float, total: float) -> tuple[float, float] | tuple[None, None]:
+    """Return a two-sided 95% Wilson score interval for a binomial rate."""
+    if total <= 0:
+        return None, None
+    z = 1.959963984540054
+    proportion = successes / total
+    denominator = 1 + (z * z / total)
+    centre = (proportion + z * z / (2 * total)) / denominator
+    margin = (
+        z
+        * math.sqrt((proportion * (1 - proportion) / total) + z * z / (4 * total * total))
+        / denominator
+    )
+    return round(max(0.0, centre - margin), 6), round(min(1.0, centre + margin), 6)
+
+
+def _proportion_metric(
+    name: str,
+    numerator: float,
+    denominator: float,
+    minimum: int,
+    *,
+    reconstruction: dict[str, Any],
+    maturity_label: str,
+) -> dict[str, Any]:
+    item = _metric(
+        name, numerator, denominator, minimum,
+        confidence=0.0, reconstruction=reconstruction,
+    )
+    low, high = _wilson_interval(numerator, denominator)
+    item.update({
+        "confidence_interval_lower": low,
+        "confidence_interval_upper": high,
+        "confidence_interval_method": "wilson_score_95" if low is not None else None,
+        "maturity_label": maturity_label if denominator > 0 else "insufficient",
+    })
+    return item
 
 
 def _insert_metric(
@@ -273,8 +378,9 @@ def _insert_metric(
         evaluation_run_id, scope_type, scope_value, metric_name,
         numerator, denominator, metric_value, evaluation_state,
         data_confidence, minimum_requirement, reason_codes_json,
-        reconstruction_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        reconstruction_json, confidence_interval_lower,
+        confidence_interval_upper, confidence_interval_method, maturity_label
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             run_id,
             scope_type,
@@ -288,6 +394,10 @@ def _insert_metric(
             item["minimum_requirement"],
             dumps(item["reason_codes"]),
             dumps(item["reconstruction"]),
+            item.get("confidence_interval_lower"),
+            item.get("confidence_interval_upper"),
+            item.get("confidence_interval_method"),
+            item.get("maturity_label", "insufficient"),
         ),
     )
 
@@ -312,10 +422,16 @@ def _eligible_periods(
             reasons.append("observation_period_not_completed")
         if not item["incident_reporting_complete"]:
             reasons.append("incident_reporting_not_declared_complete")
+        if item.get("declared_outcome") not in {
+            "no_meaningful_issue", "issue_occurred"
+        }:
+            reasons.append("validation_outcome_not_declared")
         if item["end_utc"] is None:
             reasons.append("observation_period_has_no_end")
         if (item["coverage_ratio"] or 0) < policy.minimum_window_coverage:
             reasons.append("observation_period_coverage_below_threshold")
+        if item.get("missing_intervals"):
+            reasons.append("observation_period_has_unexplained_gaps")
         if item["end_utc"] and (
             (start and item["end_utc"] < start)
             or (end and item["start_utc"] > end)
@@ -489,6 +605,67 @@ def _window_evaluation_details(
     }
 
 
+def _incident_monitoring_eligibility(
+    connection: sqlite3.Connection,
+    incident: dict[str, Any],
+    policy: ValidationPolicy,
+) -> tuple[bool, list[str], dict[str, Any]]:
+    """Verify that monitoring existed immediately before a reported incident.
+
+    A missed alert can only be called a false negative when SmartOps had a fair
+    opportunity to observe the machine. Deliberate shutdown and missing data
+    are excluded rather than interpreted as Normal.
+    """
+    incident_time = _parse(incident["start_utc"])
+    period_start = incident_time.timestamp() - policy.incident_monitoring_lookback_seconds
+    start_utc = datetime.fromtimestamp(period_start, tz=timezone.utc).isoformat()
+    expected = max(1, math.ceil(policy.incident_monitoring_lookback_seconds / 300))
+    row = connection.execute(
+        """SELECT COUNT(*) total,
+        SUM(CASE WHEN is_complete = 1 AND coverage_ratio >= ?
+          AND (finalization_state IS NULL OR finalization_state IN ('finalized','audited_correction'))
+          THEN 1 ELSE 0 END) eligible
+        FROM feature_windows WHERE device_id = ?
+        AND window_start_utc >= ? AND window_end_utc <= ?""",
+        (
+            policy.minimum_window_coverage,
+            incident["device_id"], start_utc, incident["start_utc"],
+        ),
+    ).fetchone()
+    eligible = int(row["eligible"] or 0)
+    coverage = min(1.0, eligible / expected)
+    reasons: list[str] = []
+    if coverage < policy.minimum_incident_monitoring_coverage:
+        reasons.append("insufficient_monitoring_before_incident")
+    return not reasons, reasons, {
+        "monitoring_start_utc": start_utc,
+        "incident_start_utc": incident["start_utc"],
+        "expected_finalized_windows": expected,
+        "eligible_finalized_windows": eligible,
+        "coverage_ratio": round(coverage, 6),
+        "minimum_coverage": policy.minimum_incident_monitoring_coverage,
+    }
+
+
+def _maturity(
+    positive_units: int,
+    negative_units: int,
+    distinct_days: int,
+) -> tuple[str, int, int]:
+    stronger, moderate, preliminary = MATURITY_LEVELS
+    if all((positive_units >= stronger[1], negative_units >= stronger[2], distinct_days >= stronger[3])):
+        return stronger[0], 0, 0
+    if all((positive_units >= moderate[1], negative_units >= moderate[2], distinct_days >= moderate[3])):
+        return moderate[0], max(0, stronger[1] - positive_units), max(0, stronger[2] - negative_units)
+    if all((positive_units >= preliminary[1], negative_units >= preliminary[2], distinct_days >= preliminary[3])):
+        return preliminary[0], max(0, moderate[1] - positive_units), max(0, moderate[2] - negative_units)
+    return (
+        "insufficient",
+        max(0, preliminary[1] - positive_units),
+        max(0, preliminary[2] - negative_units),
+    )
+
+
 def evaluate_database(
     database_path: Path | None = None,
     *,
@@ -585,14 +762,35 @@ def evaluate_database(
                 incident_scope: dict[int, dict[str, str]] = {}
                 confirmed_links: dict[int, list[sqlite3.Row]] = defaultdict(list)
                 for link in connection.execute(
-                    """SELECT * FROM alert_incident_links
-                    WHERE match_type = 'confirmed_match'
-                    AND origin = 'manual' AND confirmed_by_user = 1
-                    AND category_compatible = 1
-                    AND matching_version = ?""",
+                    """SELECT link.*, alert.category alert_category,
+                    alert.first_observed_utc alert_first_observed_utc,
+                    incident.category incident_category,
+                    incident.start_utc incident_start_utc
+                    FROM alert_incident_links link
+                    JOIN alerts alert ON alert.id = link.alert_id
+                    JOIN incident_reports incident ON incident.id = link.incident_id
+                    WHERE link.match_type = 'confirmed_match'
+                    AND link.category_compatible = 1
+                    AND link.matching_version = ?""",
                     (MATCHING_VERSION,),
                 ):
-                    confirmed_links[int(link["incident_id"])].append(link)
+                    lead = (
+                        _parse(link["incident_start_utc"])
+                        - _parse(link["alert_first_observed_utc"])
+                    ).total_seconds()
+                    horizon = CATEGORY_WARNING_HORIZONS_SECONDS.get(
+                        link["alert_category"], policy.matching_lookback_seconds
+                    )
+                    category_ok = link["incident_category"] in CATEGORY_COMPATIBILITY.get(
+                        link["alert_category"], set()
+                    )
+                    if category_ok and 0 <= lead <= horizon:
+                        confirmed_links[int(link["incident_id"])].append(link)
+                qualifying_confirmed_alert_ids = {
+                    int(link["alert_id"])
+                    for links in confirmed_links.values()
+                    for link in links
+                }
 
                 for incident in incidents:
                     reasons: list[str] = []
@@ -600,19 +798,29 @@ def evaluate_database(
                         reasons.append("incident_withdrawn")
                     if incident["verification_status"] not in VERIFIED:
                         reasons.append("incident_not_verified")
-                    containing = [
-                        period
-                        for period in periods
+                    monitoring_ok, monitoring_reasons, monitoring_details = (
+                        _incident_monitoring_eligibility(connection, incident, policy)
+                    )
+                    containing_periods = [
+                        period for period in periods
                         if period["device_id"] == incident["device_id"]
-                        and period["start_utc"] <= incident["start_utc"]
-                        and period["end_utc"] >= incident["start_utc"]
+                        and period["start_utc"] <= incident["start_utc"] <= period["end_utc"]
                     ]
-                    if not containing:
-                        reasons.append("incident_outside_eligible_observation_period")
+                    if not monitoring_ok and containing_periods:
+                        monitoring_ok = True
+                        monitoring_reasons = []
+                        monitoring_details["eligible_observation_period_ids"] = [
+                            period["id"] for period in containing_periods
+                        ]
+                        monitoring_details["eligibility_basis"] = (
+                            "eligible_user_confirmed_observation_period"
+                        )
+                    if not monitoring_ok:
+                        reasons.extend(monitoring_reasons)
                     if reasons:
                         _record_evidence(
                             connection, run_id, "incident", incident["id"], False,
-                            None, reasons,
+                            None, reasons, monitoring_details,
                         )
                         continue
                     classification = (
@@ -628,7 +836,7 @@ def evaluate_database(
                     }
                     _record_evidence(
                         connection, run_id, "incident", incident["id"], True,
-                        classification, [],
+                        classification, [], monitoring_details,
                     )
 
                 alerts = [
@@ -647,25 +855,45 @@ def evaluate_database(
                 ]
                 alert_class: dict[int, str] = {}
                 alert_scope: dict[int, dict[str, str]] = {}
+                canonical_outcomes = {
+                    int(row["alert_id"]): dict(row)
+                    for row in connection.execute(
+                        """WITH ranked AS (
+                          SELECT occurrence.alert_id, outcome.new_outcome,
+                          outcome.event_timestamp_utc,
+                          ROW_NUMBER() OVER (
+                            PARTITION BY occurrence.alert_id
+                            ORDER BY outcome.event_timestamp_utc DESC, outcome.id DESC
+                          ) position
+                          FROM alert_outcome_events outcome
+                          JOIN alert_occurrences occurrence
+                            ON occurrence.id = outcome.alert_occurrence_id
+                        ) SELECT * FROM ranked WHERE position = 1"""
+                    )
+                }
                 for alert in alerts:
                     reasons: list[str] = []
                     classification: str | None = None
-                    if alert["feedback_id"] is None:
+                    canonical = canonical_outcomes.get(int(alert["id"]))
+                    if canonical and canonical["new_outcome"] == "false_positive":
+                        classification = "false_positive"
+                    elif canonical and canonical["new_outcome"] == "confirmed":
+                        if int(alert["id"]) in qualifying_confirmed_alert_ids:
+                            classification = "true_positive"
+                        else:
+                            reasons.append("confirmed_alert_requires_incident_match")
+                    elif canonical and canonical["new_outcome"] == "pending":
+                        reasons.append("alert_outcome_pending")
+                    elif canonical and canonical["new_outcome"] == "inconclusive":
+                        reasons.append("alert_outcome_inconclusive")
+                    elif alert["feedback_id"] is None:
                         reasons.append("alert_feedback_unavailable")
                     elif alert["feedback_status"] != "active":
                         reasons.append("alert_feedback_withdrawn")
                     elif alert["feedback_verification_status"] not in VERIFIED:
                         reasons.append("alert_feedback_not_verified")
                     elif alert["feedback_outcome"] == "confirmed_related_issue":
-                        link = connection.execute(
-                            """SELECT id FROM alert_incident_links
-                            WHERE alert_id = ? AND match_type = 'confirmed_match'
-                            AND origin = 'manual' AND confirmed_by_user = 1
-                            AND category_compatible = 1
-                            AND matching_version = ? LIMIT 1""",
-                            (alert["id"], MATCHING_VERSION),
-                        ).fetchone()
-                        if link:
+                        if int(alert["id"]) in qualifying_confirmed_alert_ids:
                             classification = "true_positive"
                         else:
                             reasons.append("confirmed_outcome_requires_confirmed_incident_link")
@@ -706,10 +934,79 @@ def evaluate_database(
                             classification, [],
                         )
                     else:
-                        _record_evidence(
-                            connection, run_id, "alert", alert["id"], False,
-                            None, reasons,
+                        # Unreviewed alerts are counted in the status summary,
+                        # but writing one exclusion row for every historical
+                        # alert on every label revision creates no additional
+                        # scientific evidence. Reviewed/pending/inconclusive
+                        # records keep their exact auditable exclusion.
+                        if reasons != ["alert_feedback_unavailable"]:
+                            _record_evidence(
+                                connection, run_id, "alert", alert["id"], False,
+                                None, reasons,
+                            )
+
+                # One completed, explicitly no-incident period is one negative
+                # validation unit. It is TN when no qualifying alert occurred,
+                # otherwise FP. Explicitly false-positive alerts outside those
+                # periods are separate reviewed negative units.
+                period_class: dict[int, str] = {}
+                period_alert_ids: set[int] = set()
+                eligible_negative_periods: list[dict[str, Any]] = []
+                for period in periods:
+                    if period.get("declared_outcome") != "no_meaningful_issue":
+                        connection.execute(
+                            """UPDATE validation_inclusion_exclusion
+                            SET included = 0, classification = NULL,
+                            reason_codes_json = ?
+                            WHERE evaluation_run_id = ? AND evidence_type = 'observation_period'
+                            AND evidence_id = ?""",
+                            (dumps(["period_reports_issue_not_negative_evidence"]), run_id, period["id"]),
                         )
+                        continue
+                    overlapping_incidents = [
+                        item["id"] for item in incidents
+                        if item["status"] == "active"
+                        and item["device_id"] == period["device_id"]
+                        and period["start_utc"] <= item["start_utc"] <= period["end_utc"]
+                    ]
+                    if overlapping_incidents:
+                        connection.execute(
+                            """UPDATE validation_inclusion_exclusion
+                            SET included = 0, classification = NULL,
+                            reason_codes_json = ?, details_json = ?
+                            WHERE evaluation_run_id = ? AND evidence_type = 'observation_period'
+                            AND evidence_id = ?""",
+                            (
+                                dumps(["no_issue_declaration_conflicts_with_reported_incident"]),
+                                dumps({"incident_ids": overlapping_incidents}),
+                                run_id, period["id"],
+                            ),
+                        )
+                        continue
+                    qualifying = sorted({
+                        int(item["id"]) for item in alerts
+                        if item["device_id"] == period["device_id"]
+                        and item["first_observed_utc"] < period["end_utc"]
+                        and item["latest_observed_utc"] >= period["start_utc"]
+                    })
+                    classification = "false_positive" if qualifying else "true_negative"
+                    period_class[int(period["id"])] = classification
+                    period_alert_ids.update(qualifying)
+                    eligible_negative_periods.append(period)
+                    connection.execute(
+                        """UPDATE validation_inclusion_exclusion
+                        SET classification = ?, details_json = ?
+                        WHERE evaluation_run_id = ? AND evidence_type = 'observation_period'
+                        AND evidence_id = ?""",
+                        (
+                            classification,
+                            dumps({
+                                "qualifying_alert_ids": qualifying,
+                                "unit": "completed_user_confirmed_no_incident_period",
+                            }),
+                            run_id, period["id"],
+                        ),
+                    )
 
                 window_classes: dict[int, str] = {}
                 window_scopes: dict[int, str] = {}
@@ -840,6 +1137,7 @@ def evaluate_database(
                     if incident_id not in incident_class:
                         continue
                     incident = next(item for item in incidents if item["id"] == incident_id)
+                    eligible_links: list[tuple[sqlite3.Row, sqlite3.Row]] = []
                     for link in links:
                         alert = connection.execute(
                             "SELECT first_observed_utc FROM alerts WHERE id = ?",
@@ -847,6 +1145,15 @@ def evaluate_database(
                         ).fetchone()
                         if alert is None:
                             continue
+                        eligible_links.append((link, alert))
+                    if eligible_links:
+                        # Earliest qualifying warning is the reproducible lead
+                        # time for one incident; an incident is never counted
+                        # repeatedly because several related alerts exist.
+                        link, alert = min(
+                            eligible_links,
+                            key=lambda pair: pair[1]["first_observed_utc"],
+                        )
                         lead = (
                             _parse(incident["start_utc"])
                             - _parse(alert["first_observed_utc"])
@@ -874,18 +1181,28 @@ def evaluate_database(
                 alert_counts = Counter(alert_class.values())
                 incident_counts = Counter(incident_class.values())
                 window_counts = Counter(window_classes.values())
+                period_counts = Counter(period_class.values())
+                explicit_fp_outside_periods = {
+                    alert_id for alert_id, classification in alert_class.items()
+                    if classification == "false_positive"
+                    and alert_id not in period_alert_ids
+                }
+                confusion_counts = Counter({
+                    "true_positive": incident_counts["true_positive"],
+                    "false_negative": incident_counts["false_negative"],
+                    "false_positive": (
+                        period_counts["false_positive"]
+                        + len(explicit_fp_outside_periods)
+                    ),
+                    "true_negative": period_counts["true_negative"],
+                })
                 distinct_days = len(
                     {
-                        _parse(
-                            next(
-                                row["window_start_utc"]
-                                for row in connection.execute(
-                                    "SELECT window_start_utc FROM feature_windows WHERE id = ?",
-                                    (window_id,),
-                                )
-                            )
-                        ).date().isoformat()
-                        for window_id in window_classes
+                        _parse(value).date().isoformat()
+                        for value in (
+                            [item["start_utc"] for item in incidents if item["id"] in incident_class]
+                            + [item["start_utc"] for item in eligible_negative_periods]
+                        )
                     }
                 )
                 observation_seconds = sum(
@@ -897,217 +1214,102 @@ def evaluate_database(
                     for period in periods
                     if period["end_utc"]
                 )
-                eligible_total = (
-                    len(alert_class) + len(incident_class) + len(window_classes)
-                )
-                label_confidences = [
-                    float(item["data_confidence"])
-                    * (0.9 if item["timestamp_precision"] == "approximate" else 1)
-                    * (
-                        1
-                        if item["verification_status"] == "externally_verified"
-                        else 0.85
-                    )
-                    for item in incidents
-                    if item["id"] in incident_class
-                ] + [
-                    float(item["feedback_data_confidence"])
-                    * (
-                        1
-                        if item["feedback_verification_status"]
-                        == "externally_verified"
-                        else 0.85
-                    )
-                    for item in alerts
-                    if item["id"] in alert_class
-                ]
-                mean_label_confidence = (
-                    sum(label_confidences) / len(label_confidences)
-                    if label_confidences
-                    else 0.0
-                )
+                eligible_total = sum(confusion_counts.values())
                 mean_period_coverage = (
                     sum(float(item["coverage_ratio"]) for item in periods)
                     / len(periods)
                     if periods
                     else 0.0
                 )
-                confidence = min(
-                    1.0,
-                    0.35 * mean_label_confidence
-                    + 0.30 * mean_period_coverage
-                    + 0.20 * min(1.0, eligible_total / 100)
-                    + 0.15
-                    * min(
-                        1.0,
-                        distinct_days / policy.minimum_accuracy_distinct_days,
-                    ),
-                ) if eligible_total else 0.0
-                confidence_level = (
-                    "high"
-                    if confidence >= 0.8
-                    else "moderate"
-                    if confidence >= 0.5
-                    else "limited"
-                    if confidence > 0
-                    else "insufficient"
+                # Do not manufacture a validation-confidence percentage. Sample
+                # maturity and Wilson intervals communicate uncertainty.
+                confidence = 0.0
+                positive_units = (
+                    confusion_counts["true_positive"]
+                    + confusion_counts["false_negative"]
                 )
+                negative_units = (
+                    confusion_counts["true_negative"]
+                    + confusion_counts["false_positive"]
+                )
+                maturity_label, additional_positive, additional_negative = _maturity(
+                    positive_units, negative_units, distinct_days
+                )
+                confidence_level = maturity_label
+                tp = confusion_counts["true_positive"]
+                tn = confusion_counts["true_negative"]
+                fp = confusion_counts["false_positive"]
+                fn = confusion_counts["false_negative"]
+                reconstruction = {
+                    "true_positive": tp,
+                    "true_negative": tn,
+                    "false_positive": fp,
+                    "false_negative": fn,
+                    "unit_policy": "unique_incidents_and_verified_negative_units_v2",
+                }
+                precision_den = tp + fp
+                recall_den = tp + fn
+                specificity_den = tn + fp
+                total_den = tp + tn + fp + fn
                 metrics = [
-                    _metric(
-                        "precision",
-                        alert_counts["true_positive"],
-                        alert_counts["true_positive"] + alert_counts["false_positive"],
-                        policy.minimum_precision_alerts,
-                        confidence=confidence,
-                        reconstruction=dict(alert_counts),
-                    ),
-                    _metric(
-                        "recall",
-                        incident_counts["true_positive"],
-                        incident_counts["true_positive"]
-                        + incident_counts["false_negative"],
-                        policy.minimum_recall_incidents,
-                        confidence=confidence,
-                        reconstruction=dict(incident_counts),
-                    ),
+                    _proportion_metric("precision", tp, precision_den, policy.minimum_precision_alerts,
+                                       reconstruction=reconstruction, maturity_label=maturity_label),
+                    _proportion_metric("recall", tp, recall_den, policy.minimum_recall_incidents,
+                                       reconstruction=reconstruction, maturity_label=maturity_label),
+                    _proportion_metric("accuracy", tp + tn, total_den, policy.minimum_accuracy_windows,
+                                       reconstruction=reconstruction, maturity_label=maturity_label),
+                    _proportion_metric("specificity", tn, specificity_den, 1,
+                                       reconstruction=reconstruction, maturity_label=maturity_label),
+                    _proportion_metric("false_positive_rate", fp, specificity_den, 1,
+                                       reconstruction=reconstruction, maturity_label=maturity_label),
+                    _proportion_metric("false_negative_rate", fn, recall_den, 1,
+                                       reconstruction=reconstruction, maturity_label=maturity_label),
                 ]
-                accuracy_denominator = sum(window_counts.values())
-                accuracy_ready = (
-                    accuracy_denominator >= policy.minimum_accuracy_windows
-                    and observation_seconds
-                    >= policy.minimum_accuracy_period_seconds
-                    and distinct_days >= policy.minimum_accuracy_distinct_days
+                balanced_ready = recall_den > 0 and specificity_den > 0
+                tpr = tp / recall_den if recall_den else None
+                tnr = tn / specificity_den if specificity_den else None
+                tpr_low, tpr_high = _wilson_interval(tp, recall_den)
+                tnr_low, tnr_high = _wilson_interval(tn, specificity_den)
+                balanced_value = (tpr + tnr) / 2 if tpr is not None and tnr is not None else None
+                metrics.append({
+                    "metric_name": "balanced_accuracy", "numerator": None,
+                    "denominator": total_den,
+                    "metric_value": round(balanced_value, 6) if balanced_value is not None else None,
+                    "evaluation_state": "evaluated" if balanced_ready else "insufficient_labeled_evidence",
+                    "data_confidence": 0.0,
+                    "minimum_requirement": 1,
+                    "reason_codes": [] if balanced_ready else ["balanced_accuracy_requires_positive_and_negative_denominators"],
+                    "reconstruction": {**reconstruction, "true_positive_rate": tpr, "true_negative_rate": tnr},
+                    "confidence_interval_lower": round((tpr_low + tnr_low) / 2, 6) if tpr_low is not None and tnr_low is not None else None,
+                    "confidence_interval_upper": round((tpr_high + tnr_high) / 2, 6) if tpr_high is not None and tnr_high is not None else None,
+                    "confidence_interval_method": "mean_of_tpr_tnr_wilson_95" if balanced_ready else None,
+                    "maturity_label": maturity_label if balanced_ready else "insufficient",
+                })
+                precision_value = tp / precision_den if precision_den else None
+                recall_value = tp / recall_den if recall_den else None
+                f1_value = (
+                    2 * precision_value * recall_value / (precision_value + recall_value)
+                    if precision_value is not None and recall_value is not None
+                    and precision_value + recall_value > 0 else None
                 )
-                metrics.append(
-                    {
-                        "metric_name": "accuracy",
-                        "numerator": (
-                            window_counts["true_positive"]
-                            + window_counts["true_negative"]
-                        ),
-                        "denominator": accuracy_denominator,
-                        "metric_value": (
-                            round(
-                                (
-                                    window_counts["true_positive"]
-                                    + window_counts["true_negative"]
-                                )
-                                / accuracy_denominator,
-                                6,
-                            )
-                            if accuracy_ready and accuracy_denominator
-                            else None
-                        ),
-                        "evaluation_state": (
-                            "evaluated"
-                            if accuracy_ready and accuracy_denominator
-                            else "insufficient_labeled_evidence"
-                        ),
-                        "data_confidence": round(confidence, 6),
-                        "minimum_requirement": policy.minimum_accuracy_windows,
-                        "reason_codes": (
-                            []
-                            if accuracy_ready and accuracy_denominator
-                            else [
-                                value
-                                for value, missing in (
-                                    (
-                                        "minimum_accuracy_windows_not_met",
-                                        accuracy_denominator
-                                        < policy.minimum_accuracy_windows,
-                                    ),
-                                    (
-                                        "minimum_observation_duration_not_met",
-                                        observation_seconds
-                                        < policy.minimum_accuracy_period_seconds,
-                                    ),
-                                    (
-                                        "minimum_distinct_observation_days_not_met",
-                                        distinct_days
-                                        < policy.minimum_accuracy_distinct_days,
-                                    ),
-                                )
-                                if missing
-                            ]
-                        ),
-                        "reconstruction": {
-                            **dict(window_counts),
-                            "observation_seconds": observation_seconds,
-                            "minimum_observation_seconds": (
-                                policy.minimum_accuracy_period_seconds
-                            ),
-                            "distinct_observation_days": distinct_days,
-                            "minimum_distinct_observation_days": (
-                                policy.minimum_accuracy_distinct_days
-                            ),
-                        },
-                    }
-                )
-                sensitivity_den = (
-                    window_counts["true_positive"] + window_counts["false_negative"]
-                )
-                specificity_den = (
-                    window_counts["true_negative"] + window_counts["false_positive"]
-                )
-                balanced_ready = (
-                    accuracy_ready
-                    and sensitivity_den > 0
-                    and specificity_den > 0
-                )
-                metrics.append(
-                    {
-                        "metric_name": "balanced_accuracy",
-                        "numerator": None,
-                        "denominator": sum(window_counts.values()),
-                        "metric_value": (
-                            round(
-                                (
-                                    window_counts["true_positive"] / sensitivity_den
-                                    + window_counts["true_negative"] / specificity_den
-                                )
-                                / 2,
-                                6,
-                            )
-                            if balanced_ready
-                            else None
-                        ),
-                        "evaluation_state": (
-                            "evaluated"
-                            if balanced_ready
-                            else "insufficient_labeled_evidence"
-                        ),
-                        "data_confidence": round(confidence, 6),
-                        "minimum_requirement": policy.minimum_accuracy_windows,
-                        "reason_codes": (
-                            []
-                            if balanced_ready
-                            else ["balanced_accuracy_requires_both_outcome_classes"]
-                        ),
-                        "reconstruction": {
-                            "sensitivity_denominator": sensitivity_den,
-                            "specificity_denominator": specificity_den,
-                            **dict(window_counts),
-                        },
-                    }
-                )
-                false_alert_denominator = (
-                    alert_counts["true_positive"] + alert_counts["false_positive"]
-                )
-                metrics.append(
-                    _metric(
-                        "false_alert_proportion",
-                        alert_counts["false_positive"],
-                        false_alert_denominator,
-                        policy.minimum_precision_alerts,
-                        confidence=confidence,
-                        reconstruction=dict(alert_counts),
-                    )
-                )
-                mean_lead = (
-                    sum(lead_times) / len(lead_times)
-                    if len(lead_times) >= policy.minimum_lead_time_matches
-                    else None
-                )
+                metrics.append({
+                    "metric_name": "f1_score", "numerator": None,
+                    "denominator": total_den,
+                    "metric_value": round(f1_value, 6) if f1_value is not None else None,
+                    "evaluation_state": "evaluated" if f1_value is not None else "insufficient_labeled_evidence",
+                    "data_confidence": 0.0, "minimum_requirement": 1,
+                    "reason_codes": [] if f1_value is not None else ["f1_requires_precision_and_recall"],
+                    "reconstruction": {**reconstruction, "precision": precision_value, "recall": recall_value},
+                    "confidence_interval_lower": None, "confidence_interval_upper": None,
+                    "confidence_interval_method": None,
+                    "maturity_label": maturity_label if f1_value is not None else "insufficient",
+                })
+                metrics.append(_proportion_metric(
+                    "false_alert_proportion", fp, precision_den,
+                    policy.minimum_precision_alerts,
+                    reconstruction=reconstruction, maturity_label=maturity_label,
+                ))
+                mean_lead = sum(lead_times) / len(lead_times) if lead_times else None
                 metrics.append(
                     {
                         "metric_name": "mean_warning_lead_time_seconds",
@@ -1123,17 +1325,20 @@ def evaluate_database(
                         "minimum_requirement": policy.minimum_lead_time_matches,
                         "reason_codes": (
                             []
-                            if mean_lead is not None
-                            else ["minimum_matched_incidents_not_met"]
+                            if mean_lead is not None else ["no_matched_incident_lead_time"]
                         ),
                         "reconstruction": {
                             "lead_times_seconds": lead_times,
                             "late_detection_count": sum(value < 0 for value in lead_times),
                         },
+                        "confidence_interval_lower": None,
+                        "confidence_interval_upper": None,
+                        "confidence_interval_method": None,
+                        "maturity_label": maturity_label if mean_lead is not None else "insufficient",
                     }
                 )
                 sorted_leads = sorted(lead_times)
-                lead_ready = len(sorted_leads) >= policy.minimum_lead_time_matches
+                lead_ready = bool(sorted_leads)
                 median_lead = (
                     (
                         sorted_leads[len(sorted_leads) // 2]
@@ -1168,12 +1373,16 @@ def evaluate_database(
                             "reason_codes": (
                                 []
                                 if value is not None
-                                else ["minimum_matched_incidents_not_met"]
+                                else ["no_matched_incident_lead_time"]
                             ),
                             "reconstruction": {
                                 "lead_times_seconds": sorted_leads,
                                 "method": name.removesuffix("_warning_lead_time_seconds"),
                             },
+                            "confidence_interval_lower": None,
+                            "confidence_interval_upper": None,
+                            "confidence_interval_method": None,
+                            "maturity_label": maturity_label if value is not None else "insufficient",
                         }
                     )
 
@@ -1188,15 +1397,23 @@ def evaluate_database(
                         "minimum_requirement": 0,
                         "reason_codes": [],
                         "reconstruction": {"count": value},
+                        "confidence_interval_lower": None,
+                        "confidence_interval_upper": None,
+                        "confidence_interval_method": None,
+                        "maturity_label": maturity_label,
                     }
 
                 for name, value in (
                     ("verified_alert_count", len(alert_class)),
-                    ("true_positive_alert_count", alert_counts["true_positive"]),
-                    ("false_positive_alert_count", alert_counts["false_positive"]),
+                    ("true_positive_alert_count", tp),
+                    ("false_positive_alert_count", fp),
                     ("confirmed_incident_count", len(incident_class)),
-                    ("detected_incident_count", incident_counts["true_positive"]),
-                    ("missed_incident_count", incident_counts["false_negative"]),
+                    ("detected_incident_count", tp),
+                    ("missed_incident_count", fn),
+                    ("true_positive_count", tp),
+                    ("true_negative_count", tn),
+                    ("false_positive_count", fp),
+                    ("false_negative_count", fn),
                     ("true_positive_window_count", window_counts["true_positive"]),
                     ("false_positive_window_count", window_counts["false_positive"]),
                     ("false_negative_window_count", window_counts["false_negative"]),
@@ -1325,6 +1542,13 @@ def evaluate_database(
                     ).fetchone()[0]
                 )
                 finished = utc_now()
+                range_values = (
+                    [item["start_utc"] for item in incidents if item["id"] in incident_class]
+                    + [item["start_utc"] for item in eligible_negative_periods]
+                    + [item["end_utc"] for item in eligible_negative_periods if item["end_utc"]]
+                )
+                validation_start = min(range_values) if range_values else start
+                validation_end = max(range_values) if range_values else end
                 reason_codes = (
                     ["insufficient_labeled_evidence"]
                     if not any(
@@ -1346,7 +1570,11 @@ def evaluate_database(
                     eligible_incident_count = ?, eligible_window_count = ?,
                     matched_count = ?, excluded_count = ?,
                     distinct_observation_days = ?, data_confidence = ?,
-                    confidence_level = ?, reason_codes_json = ?
+                    confidence_level = ?, reason_codes_json = ?,
+                    eligible_observation_period_count = ?, observation_coverage = ?,
+                    maturity_label = ?, additional_positive_needed = ?,
+                    additional_negative_needed = ?, validation_start_utc = ?,
+                    validation_end_utc = ?
                     WHERE id = ?""",
                     (
                         finished,
@@ -1364,6 +1592,13 @@ def evaluate_database(
                         confidence,
                         confidence_level,
                         dumps(reason_codes),
+                        len(eligible_negative_periods),
+                        mean_period_coverage if eligible_negative_periods else None,
+                        maturity_label,
+                        additional_positive,
+                        additional_negative,
+                        validation_start,
+                        validation_end,
                         run_id,
                     ),
                 )
@@ -1375,7 +1610,10 @@ def evaluate_database(
 
 
 def validation_run(
-    connection: sqlite3.Connection, run_id: int
+    connection: sqlite3.Connection,
+    run_id: int,
+    *,
+    evidence_limit: int | None = None,
 ) -> dict[str, Any] | None:
     row = connection.execute(
         "SELECT * FROM validation_evaluation_runs WHERE id = ?", (run_id,)
@@ -1400,15 +1638,42 @@ def validation_run(
             (run_id,),
         )
     ]
+    evidence_sql = """SELECT * FROM validation_inclusion_exclusion
+            WHERE evaluation_run_id = ?
+            ORDER BY included DESC,
+              CASE evidence_type
+                WHEN 'incident' THEN 0
+                WHEN 'observation_period' THEN 1
+                WHEN 'alert' THEN 2
+                ELSE 3
+              END,
+              evidence_id DESC"""
+    evidence_values: tuple[Any, ...] = (run_id,)
+    if evidence_limit is not None:
+        evidence_sql += " LIMIT ?"
+        evidence_values = (run_id, evidence_limit)
+    item["evidence_decisions_total"] = int(connection.execute(
+        "SELECT COUNT(*) FROM validation_inclusion_exclusion WHERE evaluation_run_id = ?",
+        (run_id,),
+    ).fetchone()[0])
     item["evidence_decisions"] = [
         expand(value) or {}
-        for value in connection.execute(
-            """SELECT * FROM validation_inclusion_exclusion
-            WHERE evaluation_run_id = ?
-            ORDER BY included, evidence_type, evidence_id""",
-            (run_id,),
-        )
+        for value in connection.execute(evidence_sql, evidence_values)
     ]
+    overall = {
+        metric["metric_name"]: metric
+        for metric in item["metrics"]
+        if metric["scope_type"] == "overall"
+    }
+    item["confusion_matrix"] = {
+        key: int((overall.get(metric_name) or {}).get("metric_value") or 0)
+        for key, metric_name in (
+            ("true_positive", "true_positive_count"),
+            ("true_negative", "true_negative_count"),
+            ("false_positive", "false_positive_count"),
+            ("false_negative", "false_negative_count"),
+        )
+    }
     return item
 
 
@@ -1425,6 +1690,10 @@ def validation_status(
             ORDER BY finished_at_utc DESC, id DESC LIMIT 1""",
             (device, device),
         ).fetchone()
+        latest = (
+            validation_run(connection, int(run["id"]), evidence_limit=100)
+            if run is not None else None
+        )
         counts = {
             "incident_count": int(
                 connection.execute(
@@ -1444,14 +1713,32 @@ def validation_status(
             ),
             "feedback_count": int(
                 connection.execute(
-                    """SELECT COUNT(*) FROM alert_feedback f JOIN alerts a
+                    """SELECT COUNT(DISTINCT alert_id) FROM (
+                    SELECT f.alert_id FROM alert_feedback f JOIN alerts a
                     ON a.id = f.alert_id WHERE f.status = 'active'
-                    AND (? IS NULL OR a.device_id = ?)""",
-                    (device, device),
+                    AND (? IS NULL OR a.device_id = ?)
+                    UNION ALL
+                    SELECT occurrence.alert_id FROM alert_outcome_events outcome
+                    JOIN alert_occurrences occurrence ON occurrence.id = outcome.alert_occurrence_id
+                    JOIN alerts a ON a.id = occurrence.alert_id
+                    WHERE (? IS NULL OR a.device_id = ?))""",
+                    (device, device, device, device),
                 ).fetchone()[0]
             ),
-            "unverified_alert_count": len(
-                list_unverified_alerts(connection, device_id=device, limit=5000)
+            "unverified_alert_count": int(
+                connection.execute(
+                    """SELECT COUNT(*) FROM alerts alert
+                    LEFT JOIN alert_feedback feedback ON feedback.alert_id = alert.id
+                    WHERE feedback.id IS NULL
+                    AND NOT EXISTS (
+                      SELECT 1 FROM alert_occurrences occurrence
+                      JOIN alert_outcome_events outcome
+                        ON outcome.alert_occurrence_id = occurrence.id
+                      WHERE occurrence.alert_id = alert.id
+                    )
+                    AND (? IS NULL OR alert.device_id = ?)""",
+                    (device, device),
+                ).fetchone()[0]
             ),
             "completed_observation_period_count": int(
                 connection.execute(
@@ -1466,16 +1753,35 @@ def validation_status(
             "status": (
                 "not_evaluated"
                 if run is None
-                else (validation_run(connection, int(run["id"])) or {}).get("status")
+                else (latest or {}).get("status")
             ),
             "device_id": device,
             **counts,
-            "latest_run": (
-                validation_run(connection, int(run["id"])) if run is not None else None
-            ),
+            "latest_run": latest,
             "algorithm_version": ALGORITHM_VERSION,
             "configuration_version": CONFIGURATION_VERSION,
             "matching_version": MATCHING_VERSION,
+            "category_warning_horizons_seconds": CATEGORY_WARNING_HORIZONS_SECONDS,
+            "metric_definitions": {
+                "precision": "TP / (TP + FP)",
+                "recall": "TP / (TP + FN)",
+                "accuracy": "(TP + TN) / (TP + TN + FP + FN)",
+                "balanced_accuracy": "(TPR + TNR) / 2",
+                "f1_score": "2 * precision * recall / (precision + recall)",
+                "false_positive_rate": "FP / (FP + TN)",
+                "false_negative_rate": "FN / (FN + TP)",
+            },
+            "maturity_policy": [
+                {"label": label, "minimum_positive_units": positive,
+                 "minimum_negative_units": negative,
+                 "minimum_distinct_days": days}
+                for label, positive, negative, days in MATURITY_LEVELS
+            ],
+            "confidence_policy": (
+                "No arbitrary validation-confidence percentage is calculated. "
+                "Proportion metrics use 95% Wilson intervals; evidence maturity "
+                "is a versioned engineering/reporting policy."
+            ),
             "interpretation": INTERPRETATION,
         }
 

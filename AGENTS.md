@@ -96,6 +96,10 @@ v2-anchored profile assessments, immutable future-alert explanation and
 confidence snapshots, method-level validation records, append-only alert
 outcome labels, and genuine pipeline-stage state. It does not rewrite v2
 workload labels or change risk, health, RCA, alert, or notification logic.
+Schema 19 adds append-only, idempotent alert-to-incident matching decisions and
+the fields required to reconstruct automatic validation maturity, observation
+coverage, and 95% interval reporting. It preserves every schema-18 record and
+does not change prediction, baseline, health, alert, or notification logic.
 Browser display preferences still use validated
 `localStorage`, while the existing notification tables remain authoritative.
 
@@ -345,9 +349,11 @@ Browser display preferences still use validated
   declaration that incident reporting is complete, and adequate eligible
   telemetry coverage. Preventive action and short observation horizons must
   remain explicit confounders/exclusions.
-- Automatic alert-to-incident matching may propose probable or possible
-  candidates but must never create a confirmed match or claim causality.
-  Confirmed matches require explicit user action.
+- Automatic alert-to-incident matching may accept exactly one deterministic,
+  category-compatible preceding alert inside its versioned warning horizon.
+  Multiple plausible matches require explicit user confirmation. Temporal
+  matching is an evaluation association and must never be described as proof
+  of causality.
 - Incident and feedback corrections are append-only revisions. Withdrawn
   evidence remains auditable and is excluded from current metrics.
 - Keep validation matching weights, horizons, label definitions, publication

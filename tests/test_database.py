@@ -167,7 +167,7 @@ def test_phase_one_database_is_migrated_without_losing_rows(tmp_path: Path):
         "root_cause_candidates",
         "root_cause_candidate_evidence",
     }
-    assert schema_version == 18
+    assert schema_version == 19
     assert preserved_count == 1
 
 

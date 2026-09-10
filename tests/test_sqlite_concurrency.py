@@ -39,7 +39,7 @@ def test_canonical_connection_policy_uses_wal_normal_and_foreign_keys(tmp_path: 
         assert connection.execute("PRAGMA synchronous").fetchone()[0] == 1
         assert connection.execute("PRAGMA busy_timeout").fetchone()[0] == SQLITE_BUSY_TIMEOUT_MS
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 18
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 19
 
 
 def test_busy_retry_rolls_back_partial_attempt_and_succeeds_once(tmp_path: Path):
@@ -229,7 +229,7 @@ def test_schema15_to_16_adds_ownership_guards_without_data_loss(tmp_path: Path):
         connection.execute("PRAGMA user_version = 15")
     initialize_database(path)
     with database_connection(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 18
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 19
         assert connection.execute("SELECT COUNT(*) FROM metrics").fetchone()[0] == 1
         triggers = {
             row[0] for row in connection.execute(

@@ -20,10 +20,10 @@ from backend.database import read_only_database_connection
 
 CONFIDENCE_UNAVAILABLE = "Average Prediction Confidence: Not currently measurable"
 COUNT_METRICS = {
-    "tp": "true_positive_window_count",
-    "tn": "true_negative_window_count",
-    "fp": "false_positive_window_count",
-    "fn": "false_negative_window_count",
+    "tp": "true_positive_count",
+    "tn": "true_negative_count",
+    "fp": "false_positive_count",
+    "fn": "false_negative_count",
 }
 
 
@@ -116,7 +116,7 @@ def build_evaluation_report(database_path: Path | None = None) -> dict[str, Any]
             "confirmed_alert_incident_links": _count(
                 connection,
                 "alert_incident_links",
-                "WHERE match_type = 'confirmed_match' AND origin = 'manual' AND confirmed_by_user = 1",
+                "WHERE match_type = 'confirmed_match'",
             ),
             "published_validation_registry_records": _count(connection, "validation_registry"),
         }
@@ -136,12 +136,19 @@ def build_evaluation_report(database_path: Path | None = None) -> dict[str, Any]
         stale = current_signature != run["evidence_signature"]
         accuracy_row = metrics.get("accuracy", {})
         balanced_row = metrics.get("balanced_accuracy", {})
-        publishable = (
+        current_evaluation = (
             not stale
             and run["status"] == "evaluated"
             and accuracy_row.get("evaluation_state") == "evaluated"
-            and balanced_row.get("evaluation_state") == "evaluated"
             and calculated["evaluated_windows"] > 0
+        )
+        maturity = run.get("maturity_label", "insufficient")
+        publishable = (
+            current_evaluation
+            and balanced_row.get("evaluation_state") == "evaluated"
+            and maturity in {
+            "moderate_evidence", "stronger_evidence"
+            }
         )
         invalid_reasons: list[str] = []
         if stale:
@@ -154,9 +161,11 @@ def build_evaluation_report(database_path: Path | None = None) -> dict[str, Any]
             invalid_reasons.extend(json.loads(balanced_row.get("reason_codes_json") or "[]"))
         if not calculated["evaluated_windows"]:
             invalid_reasons.append("no_eligible_labelled_evaluation_windows")
+        if current_evaluation and not publishable:
+            invalid_reasons.append("preliminary_evidence_below_moderate_policy")
 
-        published_metrics = {
-            key: value if publishable else None
+        displayed_metrics = {
+            key: value if current_evaluation else None
             for key, value in calculated.items()
             if key not in {
                 "true_positives", "true_negatives", "false_positives", "false_negatives",
@@ -170,7 +179,11 @@ def build_evaluation_report(database_path: Path | None = None) -> dict[str, Any]
         if normal and failure:
             imbalance = max(normal, failure) / min(normal, failure)
         return {
-            "status": "valid_labelled_evaluation" if publishable else "insufficient_labeled_evidence",
+            "status": (
+                "valid_labelled_evaluation" if publishable
+                else "preliminary_labelled_evaluation" if current_evaluation
+                else "insufficient_labeled_evidence"
+            ),
             "scientifically_publishable": publishable,
             "database_path": str(path),
             "schema_version": schema_version,
@@ -185,7 +198,9 @@ def build_evaluation_report(database_path: Path | None = None) -> dict[str, Any]
                 "stored_evidence_is_current": not stale,
             },
             "ground_truth_inventory": inventory,
-            "evaluation_unit": "completed five-minute feature windows in eligible observation periods",
+            "evaluation_unit": (
+                "unique confirmed incidents and verified negative alert/observation units"
+            ),
             "class_mapping": {"0": "Normal / No Failure Risk", "1": "Failure Risk"},
             "training_separation": (
                 "Feature windows linked to baseline training are excluded from new validation runs."
@@ -199,14 +214,17 @@ def build_evaluation_report(database_path: Path | None = None) -> dict[str, Any]
                 "normal_samples": calculated["normal_samples"],
                 "failure_risk_samples": calculated["failure_risk_samples"],
             },
-            "metrics": published_metrics,
+            "metrics": displayed_metrics,
             "average_prediction_confidence": None,
             "average_prediction_confidence_display": CONFIDENCE_UNAVAILABLE,
             "prediction_confidence_reason": (
                 "SmartOps produces deterministic evidence indices and evidence-quality confidence, "
                 "not a calibrated probability for Class 0 or Class 1."
             ),
-            "class_imbalance_ratio": imbalance if publishable else None,
+            "class_imbalance_ratio": imbalance if current_evaluation else None,
+            "evidence_maturity": maturity,
+            "additional_positive_needed": run.get("additional_positive_needed", 0),
+            "additional_negative_needed": run.get("additional_negative_needed", 0),
             "blocking_reasons": sorted(set(invalid_reasons)),
             "formulae": {
                 "accuracy": "(TP + TN) / (TP + TN + FP + FN)",

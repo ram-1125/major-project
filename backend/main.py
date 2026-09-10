@@ -43,9 +43,11 @@ from analytics.alert_catalogue import (
     CONFIGURATION_VERSION as ALERT_CONFIGURATION_VERSION,
 )
 from analytics.alerts import acknowledge_alert
+from analytics.validation import evaluate_database as evaluate_validation_database
 from analytics.validation import validation_run, validation_status
 from analytics.validation_config import (
     CATEGORY_COMPATIBILITY,
+    CATEGORY_WARNING_HORIZONS_SECONDS,
     INTERPRETATION as VALIDATION_INTERPRETATION,
     MATCHING_VERSION as VALIDATION_MATCHING_VERSION,
 )
@@ -112,6 +114,7 @@ from backend.phase5a_repository import (
     get_latest_alerts,
 )
 from backend.phase5b_repository import (
+    append_match_event,
     close_observation_period,
     create_feedback,
     create_incident,
@@ -121,6 +124,7 @@ from backend.phase5b_repository import (
     get_feedback,
     get_incident,
     get_observation_period,
+    incident_matching_result,
     list_incidents,
     list_feedback,
     list_observation_periods,
@@ -136,6 +140,7 @@ from backend.phase5b_schemas import (
     AlertIncidentLinkCreate,
     IncidentCreate,
     IncidentRevision,
+    IncidentMatchConfirmation,
     ObservationPeriodClose,
     ObservationPeriodCreate,
     WithdrawRequest,
@@ -195,6 +200,26 @@ def _validated_range(
             detail="The start timestamp must be before or equal to the end timestamp.",
         )
     return start_utc, end_utc
+
+
+def _recalculate_validation_safely(path: Path) -> tuple[dict[str, Any] | None, str | None]:
+    """Recalculate after a user label without losing the label on failure."""
+    try:
+        result = evaluate_validation_database(path)
+        return {
+            "id": result.get("id"),
+            "status": result.get("status"),
+            "maturity_label": result.get("maturity_label"),
+            "additional_positive_needed": result.get("additional_positive_needed"),
+            "additional_negative_needed": result.get("additional_negative_needed"),
+            "confusion_matrix": result.get("confusion_matrix"),
+        }, None
+    except Exception:
+        LOGGER.exception("Automatic validation recalculation failed.")
+        return None, (
+            "The evidence was saved, but validation could not be recalculated just now. "
+            "SmartOps will retain the evidence for the next calculation."
+        )
 
 
 def create_app(
@@ -1403,9 +1428,14 @@ def create_app(
             )
         except ValueError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
+        validation_result, warning = _recalculate_validation_safely(
+            request.app.state.database_path
+        )
         return {
             "outcome": result,
             "user_reviewed_summary": review_summary,
+            "validation": validation_result,
+            "recalculation_warning": warning,
             "effect": "label_only_no_retraining_or_scoring_change",
         }
 
@@ -1658,7 +1688,9 @@ def create_app(
                 ORDER BY finished_at_utc DESC, id DESC LIMIT 1""",
                 (device, device),
             ).fetchone()
-            item = validation_run(connection, int(row["id"])) if row else None
+            item = validation_run(
+                connection, int(row["id"]), evidence_limit=100
+            ) if row else None
         return {
             "status": item["status"] if item else "not_evaluated",
             "result": item,
@@ -1865,6 +1897,8 @@ def create_app(
                 minimum_confidence=minimum_confidence,
                 maximum_confidence=maximum_confidence,
             )
+            for item in items:
+                item["matching"] = incident_matching_result(connection, int(item["id"]))
         return {
             "items": items,
             "total": total,
@@ -1906,6 +1940,8 @@ def create_app(
                 minimum_confidence=minimum_confidence,
                 maximum_confidence=maximum_confidence,
             )
+            for item in items:
+                item["matching"] = incident_matching_result(connection, int(item["id"]))
         return {
             "items": items, "total": total, "limit": limit, "offset": offset,
             "sort": sort, "start": start_utc, "end": end_utc,
@@ -1920,7 +1956,80 @@ def create_app(
             item = get_incident(connection, incident_id)
         if item is None:
             raise HTTPException(status_code=404, detail="Incident not found.")
-        return {"incident": item, "interpretation": VALIDATION_INTERPRETATION}
+        with database_connection(request.app.state.database_path) as connection:
+            matching = incident_matching_result(connection, incident_id)
+        return {"incident": item, "matching": matching,
+                "interpretation": VALIDATION_INTERPRETATION}
+
+    @local_app.get("/api/incidents/{incident_id}/matches")
+    def incident_matches(request: Request, incident_id: int) -> dict[str, object]:
+        with database_connection(request.app.state.database_path) as connection:
+            if connection.execute(
+                "SELECT 1 FROM incident_reports WHERE id = ?", (incident_id,)
+            ).fetchone() is None:
+                raise HTTPException(status_code=404, detail="Incident not found.")
+            return incident_matching_result(connection, incident_id)
+
+    @local_app.post("/api/incidents/{incident_id}/confirm-match")
+    def incident_match_confirm(
+        request: Request,
+        incident_id: int,
+        payload: IncidentMatchConfirmation,
+    ) -> dict[str, object]:
+        with database_connection(request.app.state.database_path) as connection:
+            incident = connection.execute(
+                "SELECT * FROM incident_reports WHERE id = ?", (incident_id,)
+            ).fetchone()
+            link = connection.execute(
+                """SELECT * FROM alert_incident_links WHERE incident_id = ?
+                AND alert_id = ? AND matching_version = ?""",
+                (incident_id, payload.alert_id, VALIDATION_MATCHING_VERSION),
+            ).fetchone()
+            if incident is None:
+                raise HTTPException(status_code=404, detail="Incident not found.")
+            if link is None or link["match_type"] not in {"probable_match", "possible_match"}:
+                raise HTTPException(status_code=409, detail="This match is not awaiting confirmation.")
+            with connection:
+                item = upsert_alert_incident_link(
+                    connection,
+                    alert_id=payload.alert_id,
+                    incident_id=incident_id,
+                    match_type="confirmed_match" if payload.accept else "rejected_match",
+                    origin="manual",
+                    confirmed_by_user=payload.accept,
+                    matching_score=float(link["matching_score"]),
+                    time_difference_seconds=link["time_difference_seconds"],
+                    category_compatible=bool(link["category_compatible"]),
+                    matching_rule="user_review_of_automatic_proposal",
+                    supporting_evidence=(
+                        ["user_confirmed_unique_relationship"] if payload.accept else []
+                    ),
+                    contradictory_evidence=(
+                        [] if payload.accept else ["user_rejected_automatic_proposal"]
+                    ),
+                    reason_codes=["explicit_user_match_decision"],
+                )
+                append_match_event(
+                    connection,
+                    incident_id=incident_id,
+                    alert_id=payload.alert_id,
+                    link_id=int(item["id"]),
+                    previous_decision=str(link["match_type"]),
+                    new_decision="confirmed_match" if payload.accept else "rejected_match",
+                    decision_basis={"explicit_user_confirmation": payload.accept,
+                                    "causation_claimed": False},
+                    warning_horizon_seconds=None,
+                    matching_score=float(link["matching_score"]),
+                    method_version=VALIDATION_MATCHING_VERSION,
+                )
+        validation_result, warning = _recalculate_validation_safely(
+            request.app.state.database_path
+        )
+        return {"link": item, "matching": (
+                    "confirmed" if payload.accept else "rejected"),
+                "validation": validation_result,
+                "recalculation_warning": warning,
+                "interpretation": VALIDATION_INTERPRETATION}
 
     @local_app.post("/api/incidents")
     def incident_create(
@@ -1954,7 +2063,18 @@ def create_app(
                 item = create_incident(
                     connection, device_id=payload.device_id, values=values
                 )
-        return {"incident": item, "interpretation": VALIDATION_INTERPRETATION}
+        validation_result, recalculation_warning = _recalculate_validation_safely(
+            request.app.state.database_path
+        )
+        with database_connection(request.app.state.database_path) as connection:
+            matching = incident_matching_result(connection, int(item["id"]))
+        return {
+            "incident": item,
+            "matching": matching,
+            "validation": validation_result,
+            "recalculation_warning": recalculation_warning,
+            "interpretation": VALIDATION_INTERPRETATION,
+        }
 
     @local_app.post("/api/incidents/{incident_id}/revise")
     def incident_revise(
@@ -1986,7 +2106,12 @@ def create_app(
                 )
         if item is None:
             raise HTTPException(status_code=404, detail="Incident not found.")
-        return {"incident": item, "interpretation": VALIDATION_INTERPRETATION}
+        validation_result, warning = _recalculate_validation_safely(
+            request.app.state.database_path
+        )
+        return {"incident": item, "validation": validation_result,
+                "recalculation_warning": warning,
+                "interpretation": VALIDATION_INTERPRETATION}
 
     @local_app.post("/api/incidents/{incident_id}/withdraw")
     def incident_withdraw(
@@ -2007,7 +2132,12 @@ def create_app(
                 )
         if item is None:
             raise HTTPException(status_code=404, detail="Incident not found.")
-        return {"incident": item, "interpretation": VALIDATION_INTERPRETATION}
+        validation_result, warning = _recalculate_validation_safely(
+            request.app.state.database_path
+        )
+        return {"incident": item, "validation": validation_result,
+                "recalculation_warning": warning,
+                "interpretation": VALIDATION_INTERPRETATION}
 
     @local_app.post("/api/incidents/{incident_id}/link-alert")
     def incident_link_alert(
@@ -2042,6 +2172,20 @@ def create_app(
             compatible = incident["category"] in CATEGORY_COMPATIBILITY.get(
                 alert["category"], set()
             )
+            horizon = CATEGORY_WARNING_HORIZONS_SECONDS.get(alert["category"])
+            if payload.match_type == "confirmed_match" and (
+                not compatible
+                or horizon is None
+                or difference < 0
+                or difference > horizon
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "A confirmed validation match requires a compatible alert "
+                        "that precedes the incident within its documented warning horizon."
+                    ),
+                )
             with connection:
                 item = upsert_alert_incident_link(
                     connection,
@@ -2060,7 +2204,28 @@ def create_app(
                     ],
                     reason_codes=["explicit_user_classification"],
                 )
-        return {"link": item, "interpretation": VALIDATION_INTERPRETATION}
+                append_match_event(
+                    connection,
+                    incident_id=incident_id,
+                    alert_id=payload.alert_id,
+                    link_id=int(item["id"]),
+                    previous_decision=None,
+                    new_decision=payload.match_type,
+                    decision_basis={
+                        "user_reason": payload.reason,
+                        "category_compatible": compatible,
+                        "causation_claimed": False,
+                    },
+                    warning_horizon_seconds=None,
+                    matching_score=float(item["matching_score"]),
+                    method_version=VALIDATION_MATCHING_VERSION,
+                )
+        validation_result, warning = _recalculate_validation_safely(
+            request.app.state.database_path
+        )
+        return {"link": item, "validation": validation_result,
+                "recalculation_warning": warning,
+                "interpretation": VALIDATION_INTERPRETATION}
 
     @local_app.get("/api/alerts/{alert_id}/feedback")
     def alert_feedback_get(
@@ -2116,7 +2281,12 @@ def create_app(
                 item = create_feedback(
                     connection, alert_id=alert_id, values=values
                 )
-        return {"feedback": item, "interpretation": VALIDATION_INTERPRETATION}
+        validation_result, warning = _recalculate_validation_safely(
+            request.app.state.database_path
+        )
+        return {"feedback": item, "validation": validation_result,
+                "recalculation_warning": warning,
+                "interpretation": VALIDATION_INTERPRETATION}
 
     @local_app.post("/api/alerts/{alert_id}/feedback/revise")
     def alert_feedback_revise(
@@ -2150,7 +2320,12 @@ def create_app(
                 )
         if item is None:
             raise HTTPException(status_code=404, detail="Feedback not found.")
-        return {"feedback": item, "interpretation": VALIDATION_INTERPRETATION}
+        validation_result, warning = _recalculate_validation_safely(
+            request.app.state.database_path
+        )
+        return {"feedback": item, "validation": validation_result,
+                "recalculation_warning": warning,
+                "interpretation": VALIDATION_INTERPRETATION}
 
     @local_app.get("/api/validation/observation-periods")
     def observation_period_history(
@@ -2230,13 +2405,19 @@ def create_app(
                     state=payload.state,
                     missing_intervals=payload.missing_intervals,
                     interruption_notes=payload.interruption_notes,
+                    declared_outcome=payload.declared_outcome,
+                    related_incident_id=payload.related_incident_id,
                 )
         if item is None:
             raise HTTPException(
                 status_code=409,
                 detail="Only an open observation period can be closed.",
             )
-        return {"observation_period": item}
+        validation_result, warning = _recalculate_validation_safely(
+            request.app.state.database_path
+        )
+        return {"observation_period": item, "validation": validation_result,
+                "recalculation_warning": warning}
 
     @local_app.post("/api/validation/periods/{period_id}/close")
     def observation_period_close_alias(

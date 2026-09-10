@@ -13,6 +13,7 @@ from analytics.validation_config import INTERPRETATION, ValidationPolicy
 from analytics.evaluation_report import build_evaluation_report
 from backend.database import database_connection, initialize_database
 from backend.main import create_app
+from backend.postcalibration_repository import append_alert_outcome
 from backend.phase5b_repository import (
     close_observation_period,
     create_feedback,
@@ -133,7 +134,26 @@ def seed_alert(
             observed.isoformat(),
         ),
     )
-    return int(cursor.lastrowid)
+    alert_id = int(cursor.lastrowid)
+    connection.execute(
+        """INSERT INTO alert_occurrences (
+        alert_id, feature_window_id, health_assessment_id,
+        risk_assessment_id, deviation_assessment_id, observed_at_utc,
+        severity, condition_met, raw_evidence_strength,
+        effective_evidence_strength, temporal_pattern, trend_direction,
+        evidence_signature, created_at_utc
+        ) VALUES (?, ?, ?, NULL, NULL, ?, 'warning', 1, 0.8, 0.8,
+        'test_observation', 'stable', ?, ?)""",
+        (
+            alert_id,
+            window_id,
+            health_id,
+            observed.isoformat(),
+            f"test-evidence-{alert_id}",
+            observed.isoformat(),
+        ),
+    )
+    return alert_id
 
 
 def incident_values(
@@ -228,7 +248,7 @@ def test_schema8_migrates_additively_to_current_schema(tmp_path: Path):
                 "SELECT name FROM sqlite_master WHERE type='table'"
             )
         }
-    assert version == 18
+    assert version == 19
     assert count == 1
     assert {
         "validation_observation_periods",
@@ -379,7 +399,7 @@ def test_true_positive_false_positive_false_negative_true_negative_and_lead_time
     path = make_database(tmp_path)
     with database_connection(path) as connection:
         with connection:
-            seeded = [seed_window(connection, index) for index in range(4)]
+            seeded = [seed_window(connection, index) for index in range(5)]
             tp_alert = seed_alert(
                 connection, *seeded[0], minutes=1, category="system_stability"
             )
@@ -424,7 +444,28 @@ def test_true_positive_false_positive_false_negative_true_negative_and_lead_time
                 contradictory_evidence=[],
                 reason_codes=["explicit_user_classification"],
             )
-            completed_period(connection, end=BASE + timedelta(minutes=20))
+            issue_period = create_observation_period(
+                connection, device_id=DEVICE, start_utc=BASE.isoformat()
+            )
+            close_observation_period(
+                connection, issue_period["id"],
+                end_utc=(BASE + timedelta(minutes=15)).isoformat(),
+                incident_reporting_complete=True, state="completed",
+                missing_intervals=[], interruption_notes=None,
+                declared_outcome="issue_occurred",
+                related_incident_id=tp_incident["id"],
+            )
+            negative_period = create_observation_period(
+                connection, device_id=DEVICE,
+                start_utc=(BASE + timedelta(minutes=15)).isoformat(),
+            )
+            close_observation_period(
+                connection, negative_period["id"],
+                end_utc=(BASE + timedelta(minutes=25)).isoformat(),
+                incident_reporting_complete=True, state="completed",
+                missing_intervals=[], interruption_notes=None,
+                declared_outcome="no_meaningful_issue",
+            )
     result = evaluate_database(path, policy=TEST_POLICY)
     metrics = {
         row["metric_name"]: row for row in result["metrics"]
@@ -437,7 +478,8 @@ def test_true_positive_false_positive_false_negative_true_negative_and_lead_time
     assert metrics["mean_warning_lead_time_seconds"]["metric_value"] == 120
     assert len(result["lead_times"]) == 1
     report = build_evaluation_report(path)
-    assert report["scientifically_publishable"] is True
+    assert report["scientifically_publishable"] is False
+    assert report["status"] == "preliminary_labelled_evaluation"
     assert report["confusion_matrix_counts"] == {
         "TP": 1, "TN": 1, "FP": 1, "FN": 1
     }
@@ -463,7 +505,7 @@ def test_true_positive_false_positive_false_negative_true_negative_and_lead_time
                 (result["id"],),
             )
         )
-    assert len(decisions) == 4
+    assert len(decisions) == 5
     expected_labels = {
         "true_positive": (1, 1),
         "true_negative": (0, 0),
@@ -472,6 +514,8 @@ def test_true_positive_false_positive_false_negative_true_negative_and_lead_time
     }
     for decision in decisions:
         details = json.loads(decision["details_json"])
+        if "predicted_class" not in details:
+            continue
         assert (details["predicted_class"], details["true_class"]) == expected_labels[
             decision["classification"]
         ]
@@ -479,7 +523,7 @@ def test_true_positive_false_positive_false_negative_true_negative_and_lead_time
         assert details["timestamp_utc"]
         assert details["workload_context"] == "idle"
         assert "baseline_version_id" in details
-        assert details["validation_algorithm_version"] == "validation-v1"
+        assert details["validation_algorithm_version"] == "validation-v2"
 
 
 def test_preventive_action_and_short_no_issue_horizon_are_excluded(tmp_path: Path):
@@ -508,11 +552,12 @@ def test_preventive_action_and_short_no_issue_horizon_are_excluded(tmp_path: Pat
         row for row in result["metrics"]
         if row["scope_type"] == "overall" and row["metric_name"] == "precision"
     )
-    assert precision["metric_value"] is None
+    assert precision["metric_value"] == 0
+    assert precision["denominator"] == 1
     assert result["eligible_alert_count"] == 0
 
 
-def test_automatic_matching_never_confirms_causality(tmp_path: Path):
+def test_unique_automatic_match_is_accepted_without_claiming_causality(tmp_path: Path):
     path = make_database(tmp_path)
     with database_connection(path) as connection:
         with connection:
@@ -531,13 +576,12 @@ def test_automatic_matching_never_confirms_causality(tmp_path: Path):
         ).fetchone()
     assert link is not None
     assert link["origin"] == "automatic"
-    assert link["match_type"] in {
-        "probable_match", "possible_match", "rejected_match"
-    }
+    assert link["match_type"] == "confirmed_match"
     assert link["confirmed_by_user"] == 0
+    assert "temporal_match_not_causation" in link["reason_codes_json"]
 
 
-def test_uncertain_incident_is_excluded_and_late_detection_is_labelled(
+def test_uncertain_incident_and_non_preceding_alert_are_not_counted_as_warning(
     tmp_path: Path,
 ):
     path = make_database(tmp_path)
@@ -580,8 +624,8 @@ def test_uncertain_incident_is_excluded_and_late_detection_is_labelled(
             )
             completed_period(connection, end=BASE + timedelta(minutes=5))
     result = evaluate_database(path, policy=TEST_POLICY)
-    assert result["lead_times"][0]["lead_time_seconds"] == -120
-    assert result["lead_times"][0]["timing_state"] == "late_detection"
+    assert result["lead_times"] == []
+    assert result["confusion_matrix"]["false_negative"] == 1
     with database_connection(path) as connection:
         exclusion = connection.execute(
             """SELECT included, reason_codes_json
@@ -804,3 +848,109 @@ def test_feedback_api_revision_preserves_alert_lifecycle(tmp_path: Path):
         ).fetchone()[0]
     assert alert_state == "open"
     assert revisions == 2
+
+
+def test_confirmed_incident_without_preceding_alert_is_false_negative(tmp_path: Path):
+    path = make_database(tmp_path)
+    with database_connection(path) as connection:
+        with connection:
+            for index in range(3):
+                seed_window(connection, index)
+            create_incident(
+                connection, device_id=DEVICE,
+                values=incident_values(start=BASE + timedelta(minutes=15)),
+            )
+    result = evaluate_database(path, policy=TEST_POLICY)
+    repeated = evaluate_database(path, policy=TEST_POLICY)
+    assert repeated["id"] == result["id"]
+    assert result["confusion_matrix"] == {
+        "true_positive": 0, "true_negative": 0,
+        "false_positive": 0, "false_negative": 1,
+    }
+    fnr = next(item for item in result["metrics"] if item["scope_type"] == "overall" and item["metric_name"] == "false_negative_rate")
+    assert fnr["metric_value"] == 1
+    assert fnr["confidence_interval_method"] == "wilson_score_95"
+    with database_connection(path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM validation_match_events"
+        ).fetchone()[0] == 1
+
+
+def test_verified_no_incident_period_produces_tn_or_single_fp(tmp_path: Path):
+    tn_path = make_database(tmp_path / "tn")
+    with database_connection(tn_path) as connection:
+        with connection:
+            seed_window(connection, 0)
+            completed_period(connection, end=BASE + timedelta(minutes=5))
+    tn = evaluate_database(tn_path, policy=TEST_POLICY)
+    assert tn["confusion_matrix"]["true_negative"] == 1
+
+    fp_path = make_database(tmp_path / "fp")
+    with database_connection(fp_path) as connection:
+        with connection:
+            window, health = seed_window(connection, 0)
+            seed_alert(connection, window, health, minutes=1)
+            completed_period(connection, end=BASE + timedelta(minutes=5))
+    fp = evaluate_database(fp_path, policy=TEST_POLICY)
+    assert fp["confusion_matrix"]["false_positive"] == 1
+    assert fp["confusion_matrix"]["true_negative"] == 0
+
+
+def test_pending_and_inconclusive_canonical_outcomes_are_excluded(tmp_path: Path):
+    path = make_database(tmp_path)
+    with database_connection(path) as connection:
+        with connection:
+            first = seed_window(connection, 0)
+            second = seed_window(connection, 1)
+            pending = seed_alert(connection, *first, minutes=1)
+            inconclusive = seed_alert(connection, *second, minutes=6)
+            append_alert_outcome(connection, pending, "pending", note=None, reason="test")
+            append_alert_outcome(connection, inconclusive, "inconclusive", note=None, reason="test")
+    result = evaluate_database(path, policy=TEST_POLICY)
+    assert result["eligible_alert_count"] == 0
+    assert result["confusion_matrix"] == {
+        "true_positive": 0, "true_negative": 0,
+        "false_positive": 0, "false_negative": 0,
+    }
+
+
+def test_ambiguous_automatic_match_requires_confirmation(tmp_path: Path):
+    path = make_database(tmp_path)
+    with database_connection(path) as connection:
+        with connection:
+            seeded = [seed_window(connection, index) for index in range(3)]
+            seed_alert(connection, *seeded[0], minutes=1, category="system_stability")
+            seed_alert(connection, *seeded[1], minutes=6, category="system_stability")
+            incident = create_incident(
+                connection, device_id=DEVICE,
+                values=incident_values(start=BASE + timedelta(minutes=15)),
+            )
+    evaluate_database(path, policy=TEST_POLICY)
+    with database_connection(path) as connection:
+        links = list(connection.execute(
+            "SELECT match_type FROM alert_incident_links WHERE incident_id = ?",
+            (incident["id"],),
+        ))
+        events = list(connection.execute(
+            "SELECT new_decision FROM validation_match_events WHERE incident_id = ?",
+            (incident["id"],),
+        ))
+    assert len(links) == 2
+    assert all(row["match_type"] in {"probable_match", "possible_match"} for row in links)
+    assert all(row["new_decision"] == "proposed_ambiguous_match" for row in events)
+
+
+def test_api_evidence_write_recalculates_without_duplicate_outcome(tmp_path: Path):
+    path = make_database(tmp_path)
+    with database_connection(path) as connection:
+        with connection:
+            seeded = seed_window(connection, 0)
+            alert_id = seed_alert(connection, *seeded, minutes=1)
+    with TestClient(create_app(path)) as client:
+        first = client.post(f"/api/alerts/{alert_id}/outcome", json={"outcome": "false_positive"})
+        second = client.post(f"/api/alerts/{alert_id}/outcome", json={"outcome": "false_positive"})
+        assert first.status_code == second.status_code == 200
+        assert first.json()["validation"] is not None
+        assert second.json()["outcome"]["changed"] is False
+    with database_connection(path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM alert_outcome_events").fetchone()[0] == 1

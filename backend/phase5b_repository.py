@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import sqlite3
 from datetime import datetime, timezone
@@ -25,6 +26,7 @@ JSON_FIELDS = (
     "reconstruction_json",
     "details_json",
     "user_reason_codes_json",
+    "decision_basis_json",
 )
 
 
@@ -72,6 +74,13 @@ def create_observation_period(
     start_utc: str,
     interruption_notes: str | None = None,
 ) -> dict[str, Any]:
+    existing = connection.execute(
+        """SELECT id FROM validation_observation_periods
+        WHERE device_id = ? AND state = 'open' LIMIT 1""",
+        (device_id,),
+    ).fetchone()
+    if existing is not None:
+        raise ValueError("An observation period is already open for this device.")
     now = utc_now()
     cursor = connection.execute(
         """INSERT INTO validation_observation_periods (
@@ -107,6 +116,8 @@ def close_observation_period(
     state: str,
     missing_intervals: list[dict[str, Any]],
     interruption_notes: str | None,
+    declared_outcome: str = "no_meaningful_issue",
+    related_incident_id: int | None = None,
 ) -> dict[str, Any] | None:
     row = connection.execute(
         "SELECT * FROM validation_observation_periods WHERE id = ?", (period_id,)
@@ -115,8 +126,9 @@ def close_observation_period(
         return None
     windows = connection.execute(
         """SELECT COUNT(*) total,
-        SUM(CASE WHEN is_complete = 1 AND coverage_ratio >= 0.8 THEN 1 ELSE 0 END)
-        eligible
+        SUM(CASE WHEN is_complete = 1 AND coverage_ratio >= 0.8
+          AND (finalization_state IS NULL OR finalization_state IN ('finalized','audited_correction'))
+          THEN 1 ELSE 0 END) eligible
         FROM feature_windows WHERE device_id = ?
         AND window_start_utc >= ? AND window_end_utc <= ?""",
         (row["device_id"], row["start_utc"], end_utc),
@@ -131,24 +143,62 @@ def close_observation_period(
     )
     coverage = min(1.0, eligible / expected)
     reason_codes: list[str] = []
+    if declared_outcome not in {"no_meaningful_issue", "issue_occurred"}:
+        reason_codes.append("validation_outcome_not_declared")
+    if declared_outcome == "issue_occurred" and related_incident_id is None:
+        reason_codes.append("issue_outcome_requires_incident_report")
+    if declared_outcome == "issue_occurred" and related_incident_id is not None:
+        related = connection.execute(
+            """SELECT device_id, start_utc, status FROM incident_reports
+            WHERE id = ?""",
+            (related_incident_id,),
+        ).fetchone()
+        if related is None:
+            reason_codes.append("related_incident_not_found")
+        elif related["status"] != "active":
+            reason_codes.append("related_incident_is_withdrawn")
+        elif related["device_id"] != row["device_id"]:
+            reason_codes.append("related_incident_device_mismatch")
+        elif not (row["start_utc"] <= related["start_utc"] <= end_utc):
+            reason_codes.append("related_incident_outside_observation_period")
     if not incident_reporting_complete:
         reason_codes.append("incident_reporting_not_declared_complete")
     if coverage < 0.8:
         reason_codes.append("eligible_window_coverage_below_0_8")
+    overlap = connection.execute(
+        """SELECT id FROM validation_observation_periods
+        WHERE id != ? AND device_id = ? AND state = 'completed'
+        AND start_utc < ? AND end_utc > ? LIMIT 1""",
+        (period_id, row["device_id"], end_utc, row["start_utc"]),
+    ).fetchone()
+    if overlap is not None:
+        reason_codes.append("overlaps_existing_completed_validation_period")
+    server_missing = max(0, expected - eligible)
+    computed_missing = list(missing_intervals)
+    if server_missing and not computed_missing:
+        computed_missing = [{
+            "reason": "missing_or_ineligible_finalized_feature_windows",
+            "count": server_missing,
+        }]
+    if computed_missing:
+        reason_codes.append("unexplained_or_ineligible_analysis_gap")
     final_state = (
         "completed"
         if state == "completed"
         and incident_reporting_complete
         and coverage >= 0.8
+        and not reason_codes
         else state if state in {"incomplete", "withdrawn"} else "incomplete"
     )
+    eligibility_state = "eligible" if final_state == "completed" else "excluded"
     now = utc_now()
     connection.execute(
         """UPDATE validation_observation_periods SET end_utc = ?, state = ?,
         incident_reporting_complete = ?, expected_window_count = ?,
         eligible_window_count = ?, coverage_ratio = ?, missing_intervals_json = ?,
         interruption_notes = ?, reason_codes_json = ?, closed_at_utc = ?,
-        updated_at_utc = ?
+        updated_at_utc = ?, declared_outcome = ?, related_incident_id = ?,
+        eligibility_state = ?
         WHERE id = ?""",
         (
             end_utc,
@@ -157,11 +207,14 @@ def close_observation_period(
             expected,
             eligible,
             coverage,
-            dumps(missing_intervals),
+            dumps(computed_missing),
             interruption_notes,
             dumps(reason_codes),
             now,
             now,
+            declared_outcome,
+            related_incident_id,
+            eligibility_state,
             period_id,
         ),
     )
@@ -529,7 +582,12 @@ def list_unverified_alerts(
     device_id: str | None = None,
     limit: int = 100,
 ) -> list[dict[str, Any]]:
-    clauses = ["f.id IS NULL"]
+    clauses = [
+        "f.id IS NULL",
+        "NOT EXISTS (SELECT 1 FROM alert_occurrences occurrence "
+        "JOIN alert_outcome_events outcome ON outcome.alert_occurrence_id = occurrence.id "
+        "WHERE occurrence.alert_id = a.id)",
+    ]
     values: list[Any] = []
     if device_id:
         clauses.append("a.device_id = ?")
@@ -670,6 +728,92 @@ def upsert_alert_incident_link(
             (alert_id, incident_id, MATCHING_VERSION),
         ).fetchone()
     ) or {}
+
+
+def append_match_event(
+    connection: sqlite3.Connection,
+    *,
+    incident_id: int,
+    alert_id: int | None,
+    link_id: int | None,
+    previous_decision: str | None,
+    new_decision: str,
+    decision_basis: dict[str, Any],
+    warning_horizon_seconds: float | None,
+    matching_score: float | None,
+    method_version: str,
+) -> dict[str, Any]:
+    """Append one idempotent matching decision without rewriting its history."""
+    material = {
+        "incident_id": incident_id,
+        "alert_id": alert_id,
+        "previous_decision": previous_decision,
+        "new_decision": new_decision,
+        "decision_basis": decision_basis,
+        "warning_horizon_seconds": warning_horizon_seconds,
+        "matching_score": matching_score,
+        "method_version": method_version,
+    }
+    signature = hashlib.sha256(dumps(material).encode("utf-8")).hexdigest()
+    now = utc_now()
+    connection.execute(
+        """INSERT OR IGNORE INTO validation_match_events (
+        link_id, alert_id, incident_id, previous_decision, new_decision,
+        decision_basis_json, warning_horizon_seconds, matching_score,
+        decision_signature, method_version, event_timestamp_utc, created_at_utc
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            link_id, alert_id, incident_id, previous_decision, new_decision,
+            dumps(decision_basis), warning_horizon_seconds, matching_score,
+            signature, method_version, now, now,
+        ),
+    )
+    row = connection.execute(
+        """SELECT * FROM validation_match_events
+        WHERE incident_id = ? AND alert_id IS ? AND method_version = ?
+        AND decision_signature = ?""",
+        (incident_id, alert_id, method_version, signature),
+    ).fetchone()
+    return expand(row) or {}
+
+
+def incident_matching_result(
+    connection: sqlite3.Connection, incident_id: int
+) -> dict[str, Any]:
+    links = [
+        expand(row) or {}
+        for row in connection.execute(
+            """SELECT * FROM alert_incident_links WHERE incident_id = ?
+            AND matching_version = ? ORDER BY matching_score DESC, id""",
+            (incident_id, MATCHING_VERSION),
+        )
+    ]
+    confirmed = [item for item in links if item["match_type"] == "confirmed_match"]
+    proposed = [item for item in links if item["match_type"] in {"probable_match", "possible_match"}]
+    latest_event = expand(connection.execute(
+        """SELECT * FROM validation_match_events WHERE incident_id = ?
+        ORDER BY event_timestamp_utc DESC, id DESC LIMIT 1""",
+        (incident_id,),
+    ).fetchone())
+    state = (
+        "matched_automatically" if confirmed
+        else "confirmation_required" if proposed
+        else "no_qualifying_preceding_alert"
+    )
+    return {
+        "state": state,
+        "confirmed_link": confirmed[0] if confirmed else None,
+        "proposed_matches": proposed,
+        "latest_decision": latest_event,
+        "plain_language": (
+            f"Alert #{confirmed[0]['alert_id']} was uniquely matched before this incident. "
+            "Timing supports evaluation but does not prove causation."
+            if confirmed else
+            "More than one plausible preceding alert was found. Please confirm the best match."
+            if proposed else
+            "No qualifying preceding alert was found. If monitoring coverage is eligible, this incident is a potential false negative."
+        ),
+    }
 
 
 def list_validation_runs(

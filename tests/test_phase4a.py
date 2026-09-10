@@ -581,7 +581,7 @@ def test_schema_five_migrates_to_six_without_data_loss(tmp_path: Path):
                 WHERE type='table' AND name LIKE 'health_%'"""
             )
         }
-    assert version == 18
+    assert version == 19
     assert count == 1
     assert {
         "health_evaluation_runs",

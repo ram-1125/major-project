@@ -6,13 +6,13 @@ import { TechnicalEvidence } from "./TechnicalEvidence";
 afterEach(() => { cleanup(); vi.restoreAllMocks(); window.location.hash = ""; });
 
 describe("TechnicalEvidence", () => {
-  it("provides seven read-only tabs and bounded server pagination", async () => {
+  it("provides eight read-only tabs and bounded server pagination", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue({
       ok: true,
       json: async () => ({ dataset: "monitoring", items: [{ id: 1, device_id: "local" }], total: 30, limit: 25, offset: 0, read_only: true }),
     } as Response);
     render(<TechnicalEvidence apiBaseUrl="http://127.0.0.1:8000" />);
-    expect(screen.getAllByRole("tab")).toHaveLength(7);
+    expect(screen.getAllByRole("tab")).toHaveLength(8);
     expect(screen.getByText(/Audit Records remain in Settings/)).toBeVisible();
     await screen.findByText("local");
     fireEvent.click(screen.getByRole("button", { name: "Next" }));

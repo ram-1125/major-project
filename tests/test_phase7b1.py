@@ -72,7 +72,7 @@ def test_schema11_to_14_is_additive_and_preserves_history(tmp_path: Path):
         connection.execute("PRAGMA user_version = 11")
     initialize_database(path)
     with database_connection(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 18
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 19
         assert connection.execute("SELECT COUNT(*) FROM metrics").fetchone()[0] == 1
         feature_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(feature_windows)")

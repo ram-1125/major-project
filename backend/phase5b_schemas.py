@@ -54,8 +54,16 @@ class ObservationPeriodClose(ConfirmedWrite):
     end_utc: datetime
     state: Literal["completed", "incomplete", "withdrawn"]
     incident_reporting_complete: bool
+    declared_outcome: Literal["no_meaningful_issue", "issue_occurred"]
+    related_incident_id: int | None = Field(default=None, gt=0)
     missing_intervals: list[dict[str, str]] = Field(default_factory=list, max_length=100)
     interruption_notes: str | None = Field(default=None, max_length=1000)
+
+    @model_validator(mode="after")
+    def valid_declared_outcome(self) -> "ObservationPeriodClose":
+        if self.declared_outcome == "issue_occurred" and self.related_incident_id is None:
+            raise ValueError("An issue outcome requires the related Incident ID.")
+        return self
 
 
 class IncidentBase(BaseModel):
@@ -167,3 +175,8 @@ class AlertIncidentLinkCreate(ConfirmedWrite):
         "unmatched",
     ]
     reason: str = Field(min_length=3, max_length=500)
+
+
+class IncidentMatchConfirmation(ConfirmedWrite):
+    alert_id: int = Field(gt=0)
+    accept: bool

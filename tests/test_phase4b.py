@@ -703,7 +703,7 @@ def test_schema_six_migrates_additively_without_data_loss(tmp_path: Path):
         integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
         foreign_keys = connection.execute("PRAGMA foreign_key_check").fetchall()
 
-    assert version == 18
+    assert version == 19
     assert metric_count == 1
     assert "workload_suitability_assessments" in created
     assert integrity == "ok"

@@ -432,7 +432,7 @@ def test_schema_four_migrates_without_data_loss(tmp_path: Path):
                 AND name LIKE 'risk_%'"""
             )
         }
-    assert version == 18 and count == 1
+    assert version == 19 and count == 1
     assert {"risk_assessments", "risk_evidence_components"}.issubset(risk_tables)
 
 

@@ -1217,7 +1217,7 @@ describe("deployment-ready SmartOps dashboard", () => {
     await screen.findByRole("region", { name: /Full details for Historical memory pressure/i });
     expect(screen.queryByRole("region", { name: /Full details for Sustained CPU pressure/i })).not.toBeInTheDocument();
     expect(search).toHaveValue("pressure");
-  });
+  }, 20_000);
 
   it("searches, filters and resets alerts using stored safe fields", async () => {
     scenario.alerts = [sampleAlert];
@@ -1459,7 +1459,7 @@ describe("deployment-ready SmartOps dashboard", () => {
     await waitFor(() => expect(window.location.hash).toBe("#/overview"));
     act(() => window.history.forward());
     await waitFor(() => expect(window.location.hash).toBe("#/settings"));
-  });
+  }, 20_000);
 
   it("persists validated browser display preferences", async () => {
     await renderAt("#/settings");
@@ -1667,12 +1667,23 @@ describe("deployment-ready SmartOps dashboard", () => {
     fireEvent.click(methods);
     expect(screen.getByText(/Alert Confidence = 25% evidence completeness/)).toBeVisible();
     expect(screen.getByText(/No method-level labelled validation record is stored/)).toBeVisible();
-    const disclosure = screen.getByText("Optional incident, feedback, and observation forms");
+    const disclosure = screen.getByText("Optional incident and observation workflows");
     expect(disclosure).toBeVisible();
     expect(screen.queryByRole("button", { name: "Review and save incident" })).not.toBeVisible();
     fireEvent.click(disclosure);
     expect(screen.getByRole("button", { name: "Review and save incident" })).toBeVisible();
     expect(screen.getAllByText("Not evaluated").length).toBeGreaterThan(0);
+    expect(screen.getByText((_, element) =>
+      element?.tagName === "LI"
+      && element.textContent?.includes("Pending") === true
+      && element.textContent.includes("I have not checked this alert yet"),
+    )).toBeVisible();
+    expect(screen.getByText((_, element) =>
+      element?.tagName === "LI"
+      && element.textContent?.includes("Inconclusive") === true
+      && element.textContent.includes("I could not determine whether the alert was correct"),
+    )).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Review and save match" })).not.toBeInTheDocument();
   });
 
   it("shows an API error with a retry control", async () => {

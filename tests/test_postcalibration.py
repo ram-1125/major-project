@@ -43,7 +43,7 @@ def _active_v2(connection: sqlite3.Connection) -> int:
     ).lastrowid)
 
 
-def test_schema17_migrates_additively_to_18_without_data_loss(tmp_path: Path):
+def test_schema17_migrates_additively_to_current_without_data_loss(tmp_path: Path):
     path = tmp_path / "schema17.db"
     initialize_database(path)
     with sqlite3.connect(path) as connection:
@@ -65,17 +65,60 @@ def test_schema17_migrates_additively_to_18_without_data_loss(tmp_path: Path):
         tables = {row[0] for row in connection.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"
         )}
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 18
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 19
         assert connection.execute("SELECT COUNT(*) FROM metrics").fetchone()[0] == 1
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
     assert {
         "fine_quality_observations", "fine_quality_assessments",
         "validation_registry", "alert_explanation_snapshots",
         "alert_outcome_events", "pipeline_stage_status",
+        "validation_match_events",
     } <= tables
 
 
-def test_schema18_migration_rolls_back_completely_on_failure(
+def test_schema18_validation_migration_does_not_replay_baseline_finalizers(
+    tmp_path: Path,
+):
+    path = tmp_path / "schema18.db"
+    initialize_database(path)
+    with sqlite3.connect(path) as connection:
+        version_id = connection.execute(
+            """INSERT INTO baseline_versions (
+            device_id,version_number,version_label,lifecycle_state,
+            algorithm_version,configuration_version,created_at_utc,
+            activated_at_utc,reason_codes_json,learning_state
+            ) VALUES ('device',1,'Rollback baseline','archived',
+            'test','test',?,?, '[]','inactive')""",
+            (NOW.isoformat(), NOW.isoformat()),
+        ).lastrowid
+        connection.execute(
+            """INSERT INTO baseline_version_profiles (
+            baseline_version_id,workload_scope,observed_window_count,
+            eligible_window_count,excluded_window_count,distinct_day_count,
+            readiness_state,reason_codes_json,feature_names_json,
+            missing_features_json,created_at_utc,updated_at_utc
+            ) VALUES (?, '__device__', 10, 10, 0, 2, 'established',
+            '[]','[]','[]',?,?)""",
+            (version_id, NOW.isoformat(), NOW.isoformat()),
+        )
+        before = list(connection.execute(
+            "SELECT * FROM baseline_version_profiles ORDER BY id"
+        ))
+        connection.execute("PRAGMA user_version=18")
+
+    initialize_database(path)
+    with sqlite3.connect(path) as connection:
+        after = list(connection.execute(
+            "SELECT * FROM baseline_version_profiles ORDER BY id"
+        ))
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 19
+        assert before == after
+        assert connection.execute(
+            "SELECT COUNT(*) FROM validation_match_events"
+        ).fetchone()[0] == 0
+
+
+def test_current_migration_rolls_back_completely_on_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
     path = tmp_path / "rollback.db"

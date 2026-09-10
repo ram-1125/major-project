@@ -377,57 +377,66 @@ For a read-only experimental/PPT classification report, run:
 ```
 
 The report uses Class 0 = Normal / No Failure Risk and Class 1 = Failure
-Risk. It reports the window-level TP/TN/FP/FN matrix, class counts, accuracy,
-balanced accuracy, precision, recall, specificity, F1, FPR, FNR, and class
-imbalance only when the latest stored run is current and meets the validation
-publication policy. Zero eligible evidence is never displayed as 0%
-performance. Newly evaluated windows preserve their prediction, independent
-label, UTC time, workload, Risk Evidence Index, baseline/rule versions, and
-source alert/incident IDs in the existing validation decision audit. Windows
-used for baseline fitting are excluded.
+Risk. Overall confusion counts use unique verified incidents as positive units
+and verified no-incident periods or explicitly reviewed false-positive alerts
+as negative units. It reports accuracy, balanced accuracy, precision, recall,
+specificity, F1, FPR, FNR, and class imbalance whenever the latest stored run
+is current and the relevant denominator exists. Zero denominators remain null,
+never 0% performance. Complete-window provenance remains available in the
+validation decision audit, and baseline-training windows are excluded from
+window-level supporting analysis.
 
 SmartOps does not currently emit a calibrated Class 0/Class 1 probability.
 Risk Evidence Index and evidence confidence are not prediction confidence, so
 Average Prediction Confidence remains `Not currently measurable` until a
 probabilistic output is calibrated and tested on independent labelled data.
 
-Phase 5B uses explicit user-reported or externally verified incidents, alert
-outcomes, confirmed links, and closed observation periods. It never treats
-missing feedback as a negative label. Uncertain, withdrawn, short-horizon,
-preventive-action-confounded, incomplete, low-coverage, and out-of-period
+Phase 5B uses explicit user-reported or externally verified incidents,
+canonical Pending/Confirmed/False positive/Inconclusive alert reviews,
+versioned matching decisions, and explicitly completed observation periods.
+It never treats missing feedback as a negative label. Pending, inconclusive,
+withdrawn, incomplete, offline, low-coverage, overlapping, and interrupted
 evidence is stored with exclusion reasons but does not enter headline metrics.
 
-Automatic alert-to-incident matching uses versioned category compatibility,
-time distance, and available workload context. It creates only probable,
-possible, or rejected candidates. A confirmed link always requires an explicit
-manual action. Alert first-active time is preserved for warning lead-time
-calculation, including negative late-detection values.
+Automatic alert-to-incident matching requires the same device, exact versioned
+category compatibility, a preceding alert inside the category-specific warning
+horizon, and uses available workload context in deterministic ranking. One
+unique qualifying match is accepted automatically; multiple plausible matches
+require simple user confirmation. Every decision is append-only and
+idempotently audited. Temporal association never proves causation.
 
-Precision is alert-level, recall is verified-incident-level, and
-accuracy/balanced accuracy is completed-observation-window-level. Default
-publication minimums are 20 eligible alerts, 10 eligible incidents, 100
-eligible windows over seven days, and five confirmed lead-time matches.
-Insufficient denominators produce a null metric with
-`insufficient_labeled_evidence`, never a fabricated zero. Supported stratified
-results are stored by category, severity, workload, and source alert
-algorithm/configuration cohort.
+TP is one verified incident with a qualifying preceding alert; FN is one
+verified incident with adequate preceding monitoring but no qualifying alert;
+FP is an explicitly reviewed false-positive alert or one eligible no-incident
+period containing an alert; TN is one eligible no-incident period without an
+alert. Duplicate evidence is de-duplicated across those units. Numeric metrics
+appear as soon as their denominator exists and remain visibly Preliminary when
+small. The reporting policy advances to Moderate evidence at 20 positive and
+20 negative units across seven days, then Stronger evidence at 50/50 across
+fourteen days.
 
-The stored formulas are `TP alerts / (TP alerts + FP alerts)`,
-`detected incidents / (detected incidents + missed incidents)`,
-`(TP windows + TN windows) / eligible windows`, and the mean of window
-sensitivity and specificity. Lead time is incident start minus alert
-first-supported observation; negative results are `late_detection`. Median,
-minimum, maximum, late/no-warning counts, feedback completion, observation
-coverage, and raw outcome counts are separate reconstructable results.
-Validation confidence is separately labelled high, moderate, limited, or
-insufficient from label source, timestamp precision, coverage, sample count,
-and distinct days.
+The stored formulas are `TP / (TP + FP)`, `TP / (TP + FN)`,
+`(TP + TN) / (TP + TN + FP + FN)`, and the mean of sensitivity and specificity.
+FPR, FNR and F1 use their conventional denominators. Lead time is incident
+start minus the earliest qualifying preceding-alert time. Mean, median,
+minimum, maximum, observation coverage and raw counts are reconstructable.
+Binomial proportions include 95% Wilson intervals. No arbitrary numeric
+validation-confidence percentage is generated; maturity is a versioned
+engineering/reporting label.
 
 Evaluation runs contain an evidence signature, source/matching versions,
 included and excluded evidence, TP/FP/FN/TN reconstruction counts, and
 per-match lead times. They are transactional and idempotent for unchanged
 evidence. User corrections are append-only revisions and withdrawals remain
 auditable.
+
+The local API recalculates validation immediately after a genuine incident,
+alert-outcome revision, match decision, legacy feedback revision, or completed
+observation period. The evidence write is preserved if recalculation fails, and
+the UI reports that limitation truthfully. GET requests never trigger matching
+or evaluation. A completed no-incident period requires finalized five-minute
+windows, at least 80% coverage, no unexplained analysis gap, explicit reporting
+completeness, and no overlap with another counted period.
 
 > SmartOps validation results are based on available user-reported or
 > externally verified outcomes. They do not by themselves establish guaranteed

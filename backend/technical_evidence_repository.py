@@ -87,6 +87,21 @@ DATASETS: dict[str, dict[str, Any]] = {
         "table": "feature_windows", "order": "window_end_utc", "search": ["device_id", "dominant_workload_class", "finalization_state"],
         "label": "Five-minute analysis periods", "description": "Finalised feature windows and source provenance.",
     },
+    "validation-decisions": {
+        "table": "validation_inclusion_exclusion", "order": "id",
+        "search": ["evidence_type", "classification", "reason_codes_json", "details_json"],
+        "label": "Validation decisions", "description": "Included and excluded evidence with exact reconstruction details.",
+    },
+    "validation-matches": {
+        "table": "validation_match_events", "order": "event_timestamp_utc",
+        "search": ["incident_id", "alert_id", "new_decision", "decision_basis_json", "method_version"],
+        "label": "Incident matching audit", "description": "Append-only automatic and user-reviewed incident-to-alert decisions.",
+    },
+    "validation-metrics": {
+        "table": "validation_metric_results", "order": "id",
+        "search": ["metric_name", "evaluation_state", "maturity_label", "reconstruction_json"],
+        "label": "Validation calculations", "description": "Exact numerators, denominators, intervals and reconstruction records.",
+    },
 }
 
 

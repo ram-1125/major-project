@@ -1576,21 +1576,29 @@ Phase 5B evaluates SmartOps alerts only against available, explicit outcome
 evidence. It does not retroactively claim that unlabelled history was
 incident-free.
 
+Schema 19 additively stores idempotent matching-decision audit events, explicit
+observation outcomes, evidence-maturity fields and proportion confidence
+intervals. Migration preserves all schema-18 telemetry, baselines, alerts,
+incidents, outcomes and analytical records.
+
 > SmartOps validation results are based on available user-reported or
 > externally verified outcomes. They do not by themselves establish guaranteed
 > failure prediction, hardware diagnosis, or universally validated accuracy.
 
 The local dashboard can:
 
-- start and explicitly close a validation observation period;
+- start and explicitly complete an optional validation observation period as
+  either **No meaningful issue occurred** or **An issue occurred**;
 - record a structured incident category, severity, exact/approximate UTC time,
   workload context, safe symptom summary, optional mapped Windows-event
   references, action and outcome;
-- record or revise an alert outcome as confirmed related issue, no issue
-  observed, preventive action taken, or uncertain;
+- immediately display the generated Incident ID and automatically look for a
+  qualifying preceding alert;
+- review an alert as Pending, Confirmed, False positive, or Inconclusive;
 - append incident corrections and preserve withdrawn reports;
 - show eligible/excluded evidence, validation readiness, precision, recall,
-  accuracy, balanced accuracy, warning lead time, and minimum-evidence status.
+  accuracy, balanced accuracy, F1, FPR, FNR, mean/median warning lead time,
+  95% intervals where appropriate, and evidence maturity.
 
 Incident categories are `system_crash`, `unexpected_restart`,
 `application_failure`, `system_freeze`, `severe_slowdown`,
@@ -1601,12 +1609,10 @@ Incident categories are `system_crash`, `unexpected_restart`,
 User-reported evidence describes an observed operational outcome and does not
 prove a hardware defect.
 
-Alert feedback supports `confirmed_related_issue`, `likely_related_issue`,
-`no_issue_observed`, `preventive_action_taken`, `uncertain`,
-`not_yet_verified`, `incorrect_category`, and `withdrawn`. Feedback stores its
-verification time/source, observation horizon, user-selected reason codes,
-structured action, continued/recovered/unclear state, and revision lineage.
-Feedback never acknowledges, resolves, recovers, or reopens the Phase 5A alert;
+The canonical alert-review choices are `pending`, `confirmed`,
+`false_positive`, and `inconclusive`. Older Phase 5B feedback records and their
+append-only revisions remain supported for compatibility and audit. Validation
+review never acknowledges, resolves, recovers, or reopens the Phase 5A alert;
 alert lifecycle and validation outcome remain separate.
 
 All notes are local user-entered fields. Do not enter passwords, command lines,
@@ -1616,53 +1622,55 @@ the structured fields submitted through the local form/API.
 
 ### Evidence eligibility and labels
 
-- A **true positive** requires verified incident evidence, a user-confirmed
-  alert-to-incident link, and confirmed-related-issue alert feedback.
-- A **false positive** requires verified `no_issue_observed` feedback, no
-  preventive-action confounder, and at least the configured observation
-  horizon (initially 24 hours).
-- A **false negative** requires a verified incident inside an eligible,
-  explicitly completed observation period without a confirmed alert link.
-- A **true negative** is possible only for a complete five-minute window inside
-  an explicitly closed period whose incident reporting was declared complete
-  and whose eligible telemetry coverage is at least 80%.
+- A **true positive** is one genuine verified incident with a qualifying
+  category-compatible alert before it and inside the category-specific warning
+  horizon.
+- A **false negative** is one genuine verified incident with adequate preceding
+  monitoring but no qualifying preceding alert.
+- A **false positive** is one alert explicitly reviewed as False positive, or
+  one eligible completed no-incident observation period containing at least one
+  qualifying alert. The same alert is never counted twice.
+- A **true negative** is one eligible completed user-confirmed no-incident
+  observation period containing no qualifying alert.
 - Unverified, uncertain, withdrawn, incomplete, interrupted, low-coverage, or
   inadequately observed evidence is excluded with stored reason codes.
 
-Automatic matching uses versioned category, time, and workload rules to create
-only probable, possible, or rejected candidates. It never confirms causality.
-A `confirmed_match` requires explicit user confirmation. Warning lead time uses
-the alert's first-active timestamp; a negative value is disclosed as late
-detection.
+Automatic matching uses exact device identity, versioned category
+compatibility, a category-specific warning horizon, time proximity, and
+available workload context. Exactly one deterministic qualifying match is
+accepted automatically. Multiple plausible matches stay proposed until the
+user confirms or rejects one. No temporal match proves causation. Warning lead
+time is incident start minus the earliest qualifying preceding-alert time, so
+only genuine advance warnings are included.
 
-Default headline publication minimums are 20 verified alerts for precision, 10
-verified incidents for recall, 100 eligible windows across at least seven
-distinct observation days for accuracy/balanced accuracy, and five confirmed matches for mean lead
-time. If a requirement is unmet, the metric is null with
-`insufficient_labeled_evidence`; it is not displayed as 0%. Metrics are also
-stored by supported category, severity, workload, and alert
-algorithm/configuration cohort. These thresholds and matching weights are
-versioned SmartOps engineering choices requiring representative external
-validation.
+Each ratio is calculated as soon as its own denominator exists. A zero
+denominator returns null / Not evaluated, never a fabricated 0%. Small results
+are visibly Preliminary. The versioned reporting policy advances to Moderate
+evidence at 20 positive units, 20 negative units and seven distinct days, and
+to Stronger evidence at 50 positive units, 50 negative units and fourteen
+distinct days. The interface states exactly how much positive and negative
+evidence is still needed. These maturity thresholds and matching horizons are
+SmartOps engineering/reporting policies, not proof of universal accuracy.
 
 Reconstructable formulas use separate denominators:
 
-- precision = true-positive alerts / (true-positive + false-positive alerts);
-- false-alert proportion = false-positive alerts / verified classified alerts;
-- recall = detected confirmed incidents / (detected + missed incidents);
-- accuracy = (true-positive + true-negative windows) / eligible labelled
-  windows;
-- balanced accuracy = (incident-window sensitivity + no-incident-window
-  specificity) / 2;
-- warning lead time = incident start UTC - alert first-supported-observation
+- precision = TP / (TP + FP);
+- recall = TP / (TP + FN);
+- specificity = TN / (TN + FP);
+- accuracy = (TP + TN) / (TP + TN + FP + FN);
+- balanced accuracy = (recall + specificity) / 2;
+- FPR = FP / (FP + TN); FNR = FN / (FN + TP);
+- F1 = 2 * precision * recall / (precision + recall);
+- warning lead time = incident start UTC - earliest qualifying preceding-alert
   UTC.
 
-Median, minimum, maximum, late-detection count, no-warning count, feedback
-completion, observation coverage, and raw TP/FP/FN/TN counts are stored
-separately. Validation confidence is reported as `high`, `moderate`, `limited`,
-or `insufficient` from verification source, timestamp precision, eligible
-coverage, labelled sample volume, and distinct observation days; it is not
-alert severity or a performance metric.
+Mean, median, minimum and maximum lead time, observation coverage, and raw
+TP/FP/FN/TN counts are stored separately. Binomial proportions use a 95%
+Wilson interval. SmartOps does not manufacture a numeric validation-confidence
+percentage and does not emit a calibrated Class 0/Class 1 probability;
+therefore Average Prediction Confidence remains **Not currently measurable**.
+Risk Evidence Index and evidence-quality confidence are not accuracy or
+prediction confidence.
 
 Commands:
 
@@ -1683,10 +1691,11 @@ Generate a read-only experimental/PPT summary with:
 
 Add `--json` for machine-readable output. This command reads only the latest
 stored validation run; it neither creates labels nor runs validation. It
-reports window-level TP/TN/FP/FN and class counts plus accuracy, balanced
-accuracy, precision, recall, specificity, F1, FPR, and FNR only when the
-evidence and publication rules are satisfied. Otherwise results remain `Not
-currently calculable`. SmartOps has no calibrated binary prediction
+reports outcome-unit TP/TN/FP/FN and class counts plus accuracy, balanced
+accuracy, precision, recall, specificity, F1, FPR, and FNR whenever the stored
+evidence is current and each required denominator exists. Preliminary results
+remain clearly marked and are not described as mature publication evidence.
+Otherwise results remain `Not currently calculable`. SmartOps has no calibrated binary prediction
 probability, so Average Prediction Confidence is `Not currently measurable`;
 Risk Evidence Index and alert evidence confidence must not be relabelled as
 prediction confidence.
@@ -1711,6 +1720,7 @@ Read-only Phase 5B API:
 - `GET /api/incidents`
 - `GET /api/incidents/history`
 - `GET /api/incidents/{incident_id}`
+- `GET /api/incidents/{incident_id}/matches`
 - `GET /api/alerts/{alert_id}/feedback`
 
 Local evidence writes:
@@ -1719,6 +1729,8 @@ Local evidence writes:
 - `POST /api/incidents/{incident_id}/revise`
 - `POST /api/incidents/{incident_id}/withdraw`
 - `POST /api/incidents/{incident_id}/link-alert`
+- `POST /api/incidents/{incident_id}/confirm-match`
+- `POST /api/alerts/{alert_id}/outcome`
 - `POST /api/alerts/{alert_id}/feedback`
 - `POST /api/alerts/{alert_id}/feedback/revise`
 - `POST /api/validation/observation-periods`
@@ -1731,8 +1743,10 @@ explicit `confirmation: true` field. Revisions are append-only. GET requests
 never trigger matching, evaluation, or backfill. CORS remains limited to the
 local Vite development address.
 
-No genuine incident or alert-feedback record is created automatically. Test
-scenarios use isolated temporary SQLite databases only.
+No genuine incident, alert outcome, or no-incident declaration is created
+automatically. Only matching and metric reconstruction run automatically after
+the user changes genuine validation evidence. Test scenarios use isolated
+temporary SQLite databases only.
 
 ## Current limitations
 

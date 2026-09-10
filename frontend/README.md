@@ -180,7 +180,8 @@ SmartOps will not inspect URLs, browser history, page titles, or content to
 distinguish it from general Browser/Media.
 
 Predictive Alerts shows a compact basis, evidence confidence,
-method-validation state, safe checks and simple append-only outcome controls.
+method-validation state, safe checks and simple append-only Pending, Confirmed,
+False positive and Inconclusive outcome controls.
 Exact immutable values, baselines, thresholds, lifecycle records and delivery
 history are available through the optional read-only **Technical Evidence**
 route. Legacy alerts are explicitly labelled and never fabricated.
@@ -191,8 +192,20 @@ unsupported items remain hidden by default; provenance and collector
 diagnostics are available in Technical Evidence. Internally, these signals
 remain analytically isolated and do not change risk, health or alert results.
 
-Technical Evidence has seven audience-oriented tabs: Monitoring, Alerts, Root
-Causes, System Health, PC Quality, Personal Baseline and Analytical Records.
+Technical Evidence has eight audience-oriented tabs: Monitoring, Alerts, Root
+Causes, System Health, PC Quality, Personal Baseline, Analytical Records and
+Validation.
 Each uses bounded server pagination and local dataset search. It is read-only;
 Audit Records remain exclusively in Settings, and Research & Validation remains
 the home for outcome metrics, dataset sufficiency and academic methodology.
+
+Research & Validation automatically refreshes after a genuine alert review,
+incident report, match decision, or completed observation period. It displays
+the Incident ID immediately, accepts only one deterministic qualifying
+preceding-alert match automatically, and asks the user to resolve ambiguous
+matches. Verified no-incident periods are optional and require an explicit
+confirmation plus adequate finalized telemetry coverage. Ratio metrics show
+their numerator, denominator and 95% Wilson interval where applicable; small
+datasets remain visibly Preliminary. Average Prediction Confidence is shown as
+Not currently measurable because SmartOps has no calibrated binary prediction
+probability.

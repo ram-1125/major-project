@@ -499,7 +499,7 @@ def test_settings_status_is_read_only_and_reports_current_schema(tmp_path: Path)
         response = client.get("/api/settings/status")
     body = response.json()
     assert response.status_code == 200
-    assert body["schema_version"] == 18
+    assert body["schema_version"] == 19
     assert body["production_sampling_seconds"] == 30
     assert body["feature_window_minutes"] == 5
     assert body["processing_mode"] == "local_only"
@@ -537,7 +537,7 @@ def test_schema9_migrates_to_current_schema_without_data_loss(tmp_path: Path):
         connection.execute("PRAGMA user_version = 9")
     initialize_database(path)
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 18
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 19
         assert connection.execute("SELECT COUNT(*) FROM metrics").fetchone()[0] == 1
         tables = {
             row[0]

@@ -1113,6 +1113,10 @@ type ValidationMetric = {
   minimum_requirement: number;
   reason_codes: string[];
   reconstruction: Record<string, unknown>;
+  confidence_interval_lower: number | null;
+  confidence_interval_upper: number | null;
+  confidence_interval_method: string | null;
+  maturity_label: string;
 };
 
 type ValidationRun = {
@@ -1126,7 +1130,14 @@ type ValidationRun = {
   excluded_count: number;
   distinct_observation_days: number;
   data_confidence: number;
-  confidence_level: "high" | "moderate" | "limited" | "insufficient";
+  confidence_level: "high" | "moderate" | "limited" | "insufficient" | "preliminary" | "moderate_evidence" | "stronger_evidence";
+  maturity_label: "insufficient" | "preliminary" | "moderate_evidence" | "stronger_evidence";
+  additional_positive_needed: number;
+  additional_negative_needed: number;
+  eligible_observation_period_count: number;
+  observation_coverage: number | null;
+  validation_start_utc: string | null;
+  validation_end_utc: string | null;
   algorithm_version: string;
   configuration_version: string;
   matching_version: string;
@@ -1199,6 +1210,23 @@ type IncidentReport = {
   symptoms_text: string;
   status: "active" | "withdrawn";
   current_revision_number: number;
+  matching?: IncidentMatching;
+};
+
+type IncidentMatch = {
+  id: number;
+  alert_id: number;
+  incident_id: number;
+  match_type: string;
+  matching_score: number;
+  time_difference_seconds: number | null;
+};
+
+type IncidentMatching = {
+  state: "matched_automatically" | "confirmation_required" | "no_qualifying_preceding_alert";
+  confirmed_link: IncidentMatch | null;
+  proposed_matches: IncidentMatch[];
+  plain_language: string;
 };
 
 type ObservationPeriod = {
@@ -1209,27 +1237,9 @@ type ObservationPeriod = {
   incident_reporting_complete: boolean;
   coverage_ratio: number | null;
   reason_codes: string[];
-};
-
-type UnverifiedAlert = {
-  id: number;
-  title: string;
-  category: string;
-  current_severity: string;
-  first_observed_utc: string;
-};
-
-type AlertFeedbackRow = {
-  id: number;
-  alert_id: number;
-  alert_title: string;
-  outcome: string;
-  verification_status: string;
-  verification_timestamp_utc: string;
-  observation_horizon_seconds: number | null;
-  condition_state: string;
-  current_revision_number: number;
-  alert_lifecycle_state: string;
+  declared_outcome: "not_declared" | "no_meaningful_issue" | "issue_occurred";
+  related_incident_id: number | null;
+  eligibility_state: string;
 };
 
 type LoadState = "loading" | "ready" | "error";
@@ -1664,6 +1674,12 @@ function ProcessSummary({ title, rows, resource, totalPercent, timestamp }: {
   );
 }
 
+function validationCount(metric: ValidationMetric | undefined): string {
+  return metric?.metric_value == null
+    ? "Not evaluated"
+    : Math.trunc(metric.metric_value).toLocaleString();
+}
+
 function App() {
   const initialPreferences = useRef(loadDashboardPreferences()).current;
   const [dashboardPreferences, setDashboardPreferences] =
@@ -1769,9 +1785,10 @@ function App() {
   const [validationRegistry, setValidationRegistry] = useState<MethodValidation[]>([]);
   const [incidents, setIncidents] = useState<IncidentReport[]>([]);
   const [observationPeriods, setObservationPeriods] = useState<ObservationPeriod[]>([]);
-  const [unverifiedAlerts, setUnverifiedAlerts] = useState<UnverifiedAlert[]>([]);
-  const [feedbackHistory, setFeedbackHistory] = useState<AlertFeedbackRow[]>([]);
   const [validationActionMessage, setValidationActionMessage] = useState("");
+  const [lastIncidentMatching, setLastIncidentMatching] = useState<{
+    incidentId: number; matching: IncidentMatching;
+  } | null>(null);
   const [incidentCategory, setIncidentCategory] = useState("application_failure");
   const [incidentSeverity, setIncidentSeverity] = useState("moderate");
   const [incidentStart, setIncidentStart] = useState(
@@ -1781,17 +1798,10 @@ function App() {
   const [revisionIncidentId, setRevisionIncidentId] = useState("");
   const [revisionSeverity, setRevisionSeverity] = useState("moderate");
   const [revisionReason, setRevisionReason] = useState("");
-  const [feedbackAlertId, setFeedbackAlertId] = useState("");
-  const [feedbackOutcome, setFeedbackOutcome] = useState("uncertain");
-  const [feedbackHorizonHours, setFeedbackHorizonHours] = useState("24");
-  const [feedbackNotes, setFeedbackNotes] = useState("");
-  const [feedbackConditionState, setFeedbackConditionState] = useState("unclear");
-  const [feedbackAction, setFeedbackAction] = useState("");
-  const [feedbackMode, setFeedbackMode] = useState<"create" | "revise">("create");
-  const [linkIncidentId, setLinkIncidentId] = useState("");
-  const [linkAlertId, setLinkAlertId] = useState("");
-  const [linkMatchType, setLinkMatchType] = useState("confirmed_match");
-  const [linkReason, setLinkReason] = useState("");
+  const [observationOutcome, setObservationOutcome] = useState<
+    "no_meaningful_issue" | "issue_occurred"
+  >("no_meaningful_issue");
+  const [observationIncidentId, setObservationIncidentId] = useState("");
   const [validationBreakdownScope, setValidationBreakdownScope] =
     useState<"category" | "severity" | "workload" | "algorithm_configuration">(
       "category",
@@ -2279,8 +2289,6 @@ function App() {
           validationResponse,
           incidentResponse,
           observationResponse,
-          unverifiedResponse,
-          feedbackResponse,
           validationRegistryResponse,
           fineQualityResponse,
           userReviewedResponse,
@@ -2292,14 +2300,6 @@ function App() {
           ),
           fetchJson<{ items: ObservationPeriod[] }>(
             requestUrl("/api/validation/observation-periods", { limit: 20 }),
-            signal,
-          ),
-          fetchJson<{ items: UnverifiedAlert[] }>(
-            requestUrl("/api/validation/unverified-alerts", { limit: 100 }),
-            signal,
-          ),
-          fetchJson<{ items: AlertFeedbackRow[] }>(
-            requestUrl("/api/validation/feedback", { limit: 20, offset: 0 }),
             signal,
           ),
           fetchJson<{ items: MethodValidation[] }>(
@@ -2319,8 +2319,6 @@ function App() {
         setValidation(validationResponse);
         setIncidents(incidentResponse.items);
         setObservationPeriods(observationResponse.items);
-        setUnverifiedAlerts(unverifiedResponse.items);
-        setFeedbackHistory(feedbackResponse.items);
         setValidationRegistry(validationRegistryResponse.items ?? []);
         setFineQuality(fineQualityResponse);
         setUserReviewedSummary(userReviewedResponse);
@@ -2806,7 +2804,7 @@ function App() {
     path: string,
     body: Record<string, unknown>,
     successMessage: string,
-  ) => {
+  ): Promise<Record<string, unknown>> => {
     const response = await fetch(requestUrl(path), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -2821,8 +2819,10 @@ function App() {
         : detail?.detail;
       throw new Error(message || `Request failed with status ${response.status}.`);
     }
+    const result = await response.json() as Record<string, unknown>;
     setValidationActionMessage(successMessage);
     await loadMetrics();
+    return result;
   };
 
   const reportIncident = async () => {
@@ -2834,7 +2834,7 @@ function App() {
       return;
     }
     try {
-      await postValidation("/api/incidents", {
+      const response = await postValidation("/api/incidents", {
         device_id: latest.device_id,
         category: incidentCategory,
         severity: incidentSeverity,
@@ -2844,7 +2844,15 @@ function App() {
         symptoms_text: incidentSymptoms.trim(),
         data_confidence: 0.75,
         confirmation: true,
-      }, "Incident saved locally. Run validation when you are ready.");
+      }, "Incident saved locally and validation recalculated.");
+      const incident = response.incident as IncidentReport | undefined;
+      const matching = response.matching as IncidentMatching | undefined;
+      if (incident && matching) {
+        setLastIncidentMatching({ incidentId: incident.id, matching });
+        setValidationActionMessage(
+          `Incident #${incident.id} saved. ${matching.plain_language}`,
+        );
+      }
       setIncidentSymptoms("");
     } catch (error) {
       setValidationActionMessage(
@@ -2891,74 +2899,6 @@ function App() {
     }
   };
 
-  const saveAlertFeedback = async () => {
-    const alertId = Number(feedbackAlertId);
-    if (!alertId) {
-      setValidationActionMessage("Select or enter an alert ID.");
-      return;
-    }
-    if (!window.confirm(
-      `${feedbackMode === "create" ? "Save" : "Revise"} this alert outcome locally?`,
-    )) return;
-    const horizon = feedbackOutcome === "no_issue_observed"
-      ? Number(feedbackHorizonHours) * 3600
-      : null;
-    const path = feedbackMode === "create"
-      ? `/api/alerts/${alertId}/feedback`
-      : `/api/alerts/${alertId}/feedback/revise`;
-    try {
-      await postValidation(path, {
-        outcome: feedbackOutcome,
-        observation_horizon_seconds: horizon,
-        verification_status: "user_reported",
-        notes: feedbackNotes.trim() || null,
-        user_reason_codes: [],
-        structured_action_taken: feedbackAction.trim() || null,
-        condition_state: feedbackConditionState,
-        preventive_action_taken: feedbackOutcome === "preventive_action_taken",
-        data_confidence: 0.75,
-        ...(feedbackMode === "revise"
-          ? { revision_reason: "User corrected the recorded alert outcome." }
-          : {}),
-        confirmation: true,
-      }, feedbackMode === "create"
-        ? "Alert feedback saved locally."
-        : "Alert feedback correction saved as a new revision.");
-      setFeedbackNotes("");
-    } catch (error) {
-      setValidationActionMessage(
-        error instanceof Error ? error.message : "Could not save alert feedback.",
-      );
-    }
-  };
-
-  const linkAlertAndIncident = async () => {
-    const incidentId = Number(linkIncidentId);
-    const alertId = Number(linkAlertId);
-    if (!incidentId || !alertId || !linkReason.trim()) {
-      setValidationActionMessage(
-        "Incident ID, alert ID, and a matching reason are required.",
-      );
-      return;
-    }
-    if (!window.confirm(
-      `Save this ${linkMatchType.replaceAll("_", " ")} as explicit user validation?`,
-    )) return;
-    try {
-      await postValidation(`/api/incidents/${incidentId}/link-alert`, {
-        alert_id: alertId,
-        match_type: linkMatchType,
-        reason: linkReason.trim(),
-        confirmation: true,
-      }, "Alert-to-incident classification saved locally.");
-      setLinkReason("");
-    } catch (error) {
-      setValidationActionMessage(
-        error instanceof Error ? error.message : "Could not save the link.",
-      );
-    }
-  };
-
   const startObservationPeriod = async () => {
     if (!latest || !window.confirm(
       "Start a local observation period now? You must explicitly close it later.",
@@ -2977,9 +2917,17 @@ function App() {
   };
 
   const closeObservationPeriod = async (periodId: number) => {
-    if (!window.confirm(
-      "Close this period and declare incident reporting complete? Only do this if all known incidents in the period were reported.",
-    )) return;
+    const relatedIncidentId = observationOutcome === "issue_occurred"
+      ? Number(observationIncidentId)
+      : null;
+    if (observationOutcome === "issue_occurred" && !relatedIncidentId) {
+      setValidationActionMessage("Report the issue first, then select its Incident ID.");
+      return;
+    }
+    const confirmation = observationOutcome === "no_meaningful_issue"
+      ? "Confirm: no meaningful issue occurred, all known incidents were reported, and this period may be used as negative validation evidence?"
+      : "Close this period as containing an issue already recorded under the selected Incident ID?";
+    if (!window.confirm(confirmation)) return;
     try {
       await postValidation(
         `/api/validation/observation-periods/${periodId}/close`,
@@ -2987,14 +2935,42 @@ function App() {
           end_utc: new Date().toISOString(),
           state: "completed",
           incident_reporting_complete: true,
+          declared_outcome: observationOutcome,
+          related_incident_id: relatedIncidentId,
           missing_intervals: [],
           confirmation: true,
         },
-        "Observation period closed. Eligibility still depends on telemetry coverage.",
+        "Observation period closed and validation recalculated. Eligibility still depends on telemetry coverage.",
       );
     } catch (error) {
       setValidationActionMessage(
         error instanceof Error ? error.message : "Could not close the period.",
+      );
+    }
+  };
+
+  const confirmIncidentMatch = async (
+    incidentId: number,
+    alertId: number,
+    accept: boolean,
+  ) => {
+    if (!window.confirm(
+      accept
+        ? `Confirm Alert #${alertId} as the best preceding warning for Incident #${incidentId}? Timing does not prove causation.`
+        : `Reject Alert #${alertId} as a match for Incident #${incidentId}?`,
+    )) return;
+    try {
+      await postValidation(`/api/incidents/${incidentId}/confirm-match`, {
+        alert_id: alertId,
+        accept,
+        confirmation: true,
+      }, accept
+        ? "Incident match confirmed and validation recalculated."
+        : "Incident match rejected and validation recalculated.");
+      setLastIncidentMatching(null);
+    } catch (error) {
+      setValidationActionMessage(
+        error instanceof Error ? error.message : "Could not save the match decision.",
       );
     }
   };
@@ -5140,9 +5116,8 @@ function App() {
                       <a
                         className="alert-report-link"
                         href="#/research-validation"
-                        onClick={() => setFeedbackAlertId(String(alert.id))}
                       >
-                        Report what happened
+                        Report a related incident
                       </a>
                       {alert.acknowledged_at_utc === null && (
                         <button
@@ -5301,10 +5276,9 @@ function App() {
                 probability or accuracy.
               </p>
               <p>
-                Accuracy = (TP + TN) / N; precision = TP / (TP + FP); recall =
-                TP / (TP + FN); specificity = TN / (TN + FP); F1 = 2 × precision
-                × recall / (precision + recall); false-positive rate = FP / (FP + TN).
-                Undefined denominators remain unavailable.
+                Exact formulas, numerator/denominator records, matching decisions and
+                reconstruction fields are available in Technical Evidence. Undefined
+                denominators remain unavailable rather than being shown as zero.
               </p>
               <h3>Method-level validation registry</h3>
               {(validationRegistry ?? []).length === 0 ? (
@@ -5377,8 +5351,8 @@ function App() {
               <p>Confirmed / (Confirmed + False positive). This is not full model accuracy. Full accuracy remains collecting until eligible true-negative and false-negative evidence exists.</p>
             </section>
 
-            <div className="validation-summary" aria-label="Validation summary">
-              {(["precision", "recall", "accuracy", "balanced_accuracy"] as const).map(
+            <div className="validation-summary" aria-label="Full validation metrics">
+              {(["precision", "recall", "accuracy", "balanced_accuracy", "f1_score", "false_positive_rate", "false_negative_rate"] as const).map(
                 (name) => {
                   const metric = validationMetrics[name];
                   return (
@@ -5391,7 +5365,7 @@ function App() {
                       </strong>
                       <p>
                         {metric?.evaluation_state === "evaluated"
-                          ? `${metric.numerator ?? "—"} / ${metric.denominator}`
+                          ? `${metric.numerator ?? "Derived"} / ${metric.denominator}${metric.confidence_interval_lower == null ? "" : ` · 95% CI ${(metric.confidence_interval_lower * 100).toFixed(1)}–${((metric.confidence_interval_upper ?? metric.confidence_interval_lower) * 100).toFixed(1)}%`}`
                           : "Insufficient labelled evidence"}
                       </p>
                     </article>
@@ -5412,6 +5386,45 @@ function App() {
                   Confirmed alert-to-incident matches only; negative means late detection
                 </p>
               </article>
+              <article>
+                <span>Median warning lead time</span>
+                <strong>
+                  {validationMetrics.median_warning_lead_time_seconds?.metric_value == null
+                    ? "Not evaluated"
+                    : formatDuration(validationMetrics.median_warning_lead_time_seconds.metric_value)}
+                </strong>
+                <p>Earliest qualifying preceding warning per incident</p>
+              </article>
+              <article>
+                <span>Average prediction confidence</span>
+                <strong>Not currently measurable</strong>
+                <p>SmartOps does not emit a calibrated Class 0/1 probability.</p>
+              </article>
+            </div>
+            <div className="validation-outcome-guide" role="note">
+              <h3>Alert review choices</h3>
+              <ul>
+                <li><strong>Pending</strong> — I have not checked this alert yet.</li>
+                <li><strong>Confirmed</strong> — I observed a real issue matching this alert.</li>
+                <li><strong>False positive</strong> — I checked and found no meaningful matching issue.</li>
+                <li><strong>Inconclusive</strong> — I could not determine whether the alert was correct.</li>
+              </ul>
+              <p>Pending, inconclusive and unreviewed alerts are excluded from validation.</p>
+            </div>
+
+            <div className="validation-confusion" aria-label="Validation confusion matrix">
+              <h3>Eligible outcome counts</h3>
+              <dl>
+                <div><dt>True positive</dt><dd>{validationCount(validationMetrics.true_positive_count)}</dd></div>
+                <div><dt>True negative</dt><dd>{validationCount(validationMetrics.true_negative_count)}</dd></div>
+                <div><dt>False positive</dt><dd>{validationCount(validationMetrics.false_positive_count)}</dd></div>
+                <div><dt>False negative</dt><dd>{validationCount(validationMetrics.false_negative_count)}</dd></div>
+              </dl>
+              <p>
+                No arbitrary validation-confidence percentage is generated. The 95% intervals
+                show sampling uncertainty; maturity labels are SmartOps engineering/reporting
+                policies, not proof of universal accuracy.
+              </p>
             </div>
 
             <div className="validation-readiness">
@@ -5425,13 +5438,13 @@ function App() {
                 </p>
               </article>
               <article>
-                <span>Validation confidence</span>
+                <span>Validation evidence maturity</span>
                 <strong>
-                  {validation?.latest_run?.confidence_level ?? "insufficient"}
+                  {(validation?.latest_run?.maturity_label ?? "insufficient").replaceAll("_", " ")}
                 </strong>
                 <p>
                   {validation?.latest_run
-                    ? `${(validation.latest_run.data_confidence * 100).toFixed(1)}% evidence confidence`
+                    ? `${validation.latest_run.additional_positive_needed} more positive and ${validation.latest_run.additional_negative_needed} more negative evidence units needed for the next policy level`
                     : "No evaluation run is available"}
                 </p>
               </article>
@@ -5446,11 +5459,12 @@ function App() {
               <article>
                 <span>Eligible observations</span>
                 <strong>
-                  {validation?.latest_run?.eligible_window_count ?? 0} windows
+                  {validation?.latest_run?.eligible_observation_period_count ?? 0} verified periods
                 </strong>
                 <p>
-                  {validation?.completed_observation_period_count ?? 0} completed
-                  reporting periods
+                  Coverage: {validation?.latest_run?.observation_coverage == null
+                    ? "Not evaluated"
+                    : `${(validation.latest_run.observation_coverage * 100).toFixed(1)}%`}
                 </p>
               </article>
               <article>
@@ -5482,7 +5496,7 @@ function App() {
             </div>
 
             <details className="validation-form-disclosure">
-              <summary>Optional incident, feedback, and observation forms</summary>
+              <summary>Optional incident and observation workflows</summary>
               <p>
                 Open this area only when you choose to provide a labelled
                 real-world observation for academic validation.
@@ -5549,102 +5563,6 @@ function App() {
               </article>
 
               <article>
-                <h3>Record alert outcome</h3>
-                <p>
-                  A confirmed issue still requires an explicit incident link before
-                  it can count as a true positive.
-                </p>
-                <label>
-                  <span>Mode</span>
-                  <select
-                    value={feedbackMode}
-                    onChange={(event) => setFeedbackMode(
-                      event.target.value as "create" | "revise",
-                    )}
-                  >
-                    <option value="create">New feedback</option>
-                    <option value="revise">Correct existing feedback</option>
-                  </select>
-                </label>
-                <label>
-                  <span>Alert</span>
-                  <select
-                    value={feedbackAlertId}
-                    onChange={(event) => setFeedbackAlertId(event.target.value)}
-                  >
-                    <option value="">Select an unverified alert</option>
-                    {unverifiedAlerts.map((alert) => (
-                      <option value={alert.id} key={alert.id}>
-                        #{alert.id} · {alert.title}
-                      </option>
-                    ))}
-                    {feedbackMode === "revise" && alertHistory.map((alert) => (
-                      <option value={alert.id} key={`revision-${alert.id}`}>
-                        #{alert.id} · {alert.title}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label>
-                  <span>Observed outcome</span>
-                  <select
-                    value={feedbackOutcome}
-                    onChange={(event) => setFeedbackOutcome(event.target.value)}
-                  >
-                    <option value="uncertain">Uncertain</option>
-                    <option value="confirmed_related_issue">Confirmed related issue</option>
-                    <option value="likely_related_issue">Likely related issue</option>
-                    <option value="no_issue_observed">No issue observed</option>
-                    <option value="preventive_action_taken">Preventive action taken</option>
-                    <option value="not_yet_verified">Not yet verified</option>
-                    <option value="incorrect_category">Incorrect category</option>
-                    <option value="withdrawn">Withdrawn</option>
-                  </select>
-                </label>
-                {feedbackOutcome === "no_issue_observed" && (
-                  <label>
-                    <span>Observation horizon (hours)</span>
-                    <input
-                      type="number"
-                      min="0"
-                      value={feedbackHorizonHours}
-                      onChange={(event) => setFeedbackHorizonHours(event.target.value)}
-                    />
-                  </label>
-                )}
-                <label>
-                  <span>Condition after observation</span>
-                  <select
-                    value={feedbackConditionState}
-                    onChange={(event) => setFeedbackConditionState(event.target.value)}
-                  >
-                    <option value="unclear">Unclear</option>
-                    <option value="continued">Continued</option>
-                    <option value="recovered">Recovered</option>
-                  </select>
-                </label>
-                <label>
-                  <span>Structured action taken (optional)</span>
-                  <input
-                    value={feedbackAction}
-                    onChange={(event) => setFeedbackAction(event.target.value)}
-                    maxLength={500}
-                  />
-                </label>
-                <label>
-                  <span>Notes (optional)</span>
-                  <textarea
-                    value={feedbackNotes}
-                    onChange={(event) => setFeedbackNotes(event.target.value)}
-                    maxLength={1500}
-                  />
-                </label>
-                <button type="button" onClick={() => void saveAlertFeedback()}>
-                  Review and save feedback
-                </button>
-              </article>
-
-              <article>
                 <h3>Observation period</h3>
                 <p>
                   True negatives are eligible only after a covered period is
@@ -5662,13 +5580,41 @@ function App() {
                         <dd>Open · no negative labels inferred</dd>
                       </div>
                     </dl>
+                    <label>
+                      <span>What occurred during this period?</span>
+                      <select
+                        value={observationOutcome}
+                        onChange={(event) => setObservationOutcome(
+                          event.target.value as "no_meaningful_issue" | "issue_occurred",
+                        )}
+                      >
+                        <option value="no_meaningful_issue">No meaningful issue occurred</option>
+                        <option value="issue_occurred">An issue occurred</option>
+                      </select>
+                    </label>
+                    {observationOutcome === "issue_occurred" && (
+                      <label>
+                        <span>Reported Incident ID</span>
+                        <select
+                          value={observationIncidentId}
+                          onChange={(event) => setObservationIncidentId(event.target.value)}
+                        >
+                          <option value="">Select the incident you reported</option>
+                          {incidents.filter((incident) => incident.status === "active").map((incident) => (
+                            <option key={incident.id} value={incident.id}>
+                              Incident #{incident.id} · {incident.category.replaceAll("_", " ")}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    )}
                     <button
                       type="button"
                       onClick={() => void closeObservationPeriod(
                         openObservationPeriod.id,
                       )}
                     >
-                      Review and close period
+                      Complete observation period
                     </button>
                   </>
                 ) : (
@@ -5678,13 +5624,18 @@ function App() {
                 )}
                 <h3>Correct an incident</h3>
                 <label>
-                  <span>Incident ID</span>
-                  <input
-                    type="number"
-                    min="1"
+                  <span>Incident report</span>
+                  <select
                     value={revisionIncidentId}
                     onChange={(event) => setRevisionIncidentId(event.target.value)}
-                  />
+                  >
+                    <option value="">Select an incident</option>
+                    {incidents.map((incident) => (
+                      <option key={incident.id} value={incident.id}>
+                        Incident #{incident.id} · {incident.category.replaceAll("_", " ")}
+                      </option>
+                    ))}
+                  </select>
                 </label>
                 <label>
                   <span>Corrected severity</span>
@@ -5709,49 +5660,11 @@ function App() {
                 <button type="button" onClick={() => void reviseIncident()}>
                   Review and append correction
                 </button>
-                <h3>Link alert and incident</h3>
-                <label>
-                  <span>Incident ID</span>
-                  <input
-                    type="number"
-                    min="1"
-                    value={linkIncidentId}
-                    onChange={(event) => setLinkIncidentId(event.target.value)}
-                  />
-                </label>
-                <label>
-                  <span>Alert ID</span>
-                  <input
-                    type="number"
-                    min="1"
-                    value={linkAlertId}
-                    onChange={(event) => setLinkAlertId(event.target.value)}
-                  />
-                </label>
-                <label>
-                  <span>Match classification</span>
-                  <select
-                    value={linkMatchType}
-                    onChange={(event) => setLinkMatchType(event.target.value)}
-                  >
-                    <option value="confirmed_match">Confirmed match</option>
-                    <option value="probable_match">Probable match</option>
-                    <option value="possible_match">Possible match</option>
-                    <option value="rejected_match">Rejected match</option>
-                    <option value="unmatched">Unmatched</option>
-                  </select>
-                </label>
-                <label>
-                  <span>Supporting or contradictory reason</span>
-                  <input
-                    value={linkReason}
-                    onChange={(event) => setLinkReason(event.target.value)}
-                    maxLength={500}
-                  />
-                </label>
-                <button type="button" onClick={() => void linkAlertAndIncident()}>
-                  Review and save match
-                </button>
+                <p>
+                  SmartOps matches incidents to preceding alerts automatically. If
+                  more than one plausible alert exists, a simple confirmation choice
+                  appears after the incident is saved.
+                </p>
               </article>
             </div>
             </details>
@@ -5760,6 +5673,28 @@ function App() {
               <p className="validation-action" role="status">
                 {validationActionMessage}
               </p>
+            )}
+            {lastIncidentMatching?.matching.state === "confirmation_required" && (
+              <section className="validation-match-review" aria-live="polite">
+                <h3>Review proposed alert match for Incident #{lastIncidentMatching.incidentId}</h3>
+                <p>{lastIncidentMatching.matching.plain_language}</p>
+                {lastIncidentMatching.matching.proposed_matches.map((match) => (
+                  <div key={match.id}>
+                    <span>
+                      Alert #{match.alert_id} · {match.time_difference_seconds == null
+                        ? "time difference unavailable"
+                        : `${formatDuration(match.time_difference_seconds)} before the incident`}
+                    </span>
+                    <button type="button" onClick={() => void confirmIncidentMatch(
+                      lastIncidentMatching.incidentId, match.alert_id, true,
+                    )}>Confirm this match</button>
+                    <button type="button" onClick={() => void confirmIncidentMatch(
+                      lastIncidentMatching.incidentId, match.alert_id, false,
+                    )}>Not this alert</button>
+                  </div>
+                ))}
+                <p>Temporal matching supports validation but does not prove causation.</p>
+              </section>
             )}
 
             <div className="section-heading section-heading--controls">
@@ -5813,43 +5748,6 @@ function App() {
 
             <div className="section-heading">
               <div>
-                <p className="eyebrow">Alert lifecycle remains separate</p>
-                <h3>Recent alert-feedback revisions</h3>
-              </div>
-              <span>{feedbackHistory.length} current feedback records shown</span>
-            </div>
-            {feedbackHistory.length === 0 ? (
-              <div className="alert-empty">
-                <strong>No alert feedback has been recorded.</strong>
-                <p>Unverified alerts are not classified as false alerts.</p>
-              </div>
-            ) : (
-              <div className="table-wrap">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Verified</th><th>Alert</th><th>Outcome</th>
-                      <th>Condition</th><th>Revision</th><th>Alert lifecycle</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {feedbackHistory.map((feedback) => (
-                      <tr key={feedback.id}>
-                        <td>{formatTimestamp(feedback.verification_timestamp_utc)}</td>
-                        <td>#{feedback.alert_id} · {feedback.alert_title}</td>
-                        <td>{feedback.outcome.replaceAll("_", " ")}</td>
-                        <td>{feedback.condition_state}</td>
-                        <td>{feedback.current_revision_number}</td>
-                        <td>{feedback.alert_lifecycle_state}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-
-            <div className="section-heading">
-              <div>
                 <p className="eyebrow">Append-only evidence history</p>
                 <h3>Recent incident reports</h3>
               </div>
@@ -5865,16 +5763,40 @@ function App() {
                 <table>
                   <thead>
                     <tr>
-                      <th>Start</th><th>Category</th><th>Severity</th>
-                      <th>Verification</th><th>State</th><th>Revision</th><th>Action</th>
+                      <th>Incident ID</th><th>Start</th><th>Category</th><th>Severity</th>
+                      <th>Matching</th><th>Verification</th><th>State</th><th>Revision</th><th>Action</th>
                     </tr>
                   </thead>
                   <tbody>
                     {incidents.map((incident) => (
                       <tr key={incident.id}>
+                        <td>
+                          <button
+                            type="button"
+                            aria-label={`Copy Incident ID ${incident.id}`}
+                            onClick={() => void navigator.clipboard?.writeText(String(incident.id))}
+                          >
+                            #{incident.id}
+                          </button>
+                        </td>
                         <td>{formatTimestamp(incident.start_utc)}</td>
                         <td>{incident.category.replaceAll("_", " ")}</td>
                         <td>{incident.severity}</td>
+                        <td>
+                          <p>{incident.matching?.plain_language ?? "Not evaluated under the current matching method"}</p>
+                          {incident.matching?.state === "confirmation_required"
+                            && incident.matching.proposed_matches.map((match) => (
+                              <span className="incident-match-actions" key={match.id}>
+                                Alert #{match.alert_id}
+                                <button type="button" onClick={() => void confirmIncidentMatch(
+                                  incident.id, match.alert_id, true,
+                                )}>Confirm</button>
+                                <button type="button" onClick={() => void confirmIncidentMatch(
+                                  incident.id, match.alert_id, false,
+                                )}>Reject</button>
+                              </span>
+                            ))}
+                        </td>
                         <td>{incident.verification_status.replaceAll("_", " ")}</td>
                         <td>{incident.status}</td>
                         <td>{incident.current_revision_number}</td>
@@ -5900,6 +5822,9 @@ function App() {
               configuration {validation?.configuration_version ?? "Unavailable"} ·
               matching {validation?.matching_version ?? "Unavailable"}
             </p>
+            <a className="technical-evidence-link" href="#/technical-evidence?dataset=validation-metrics">
+              Open exact validation formulas, identifiers, matching audit and reconstruction records
+            </a>
           </section>
 
           {activeRoute === "technical-evidence" && (

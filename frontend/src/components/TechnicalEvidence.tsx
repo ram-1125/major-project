@@ -12,6 +12,7 @@ const FALLBACK_DATASETS: Dataset[] = [
   { key: "pc-quality", label: "PC Quality", description: "Assessments and contribution calculations", sources: [["pc-quality", "Assessments"], ["pc-quality-contributions", "Metric contributions"]] },
   { key: "personal-baseline", label: "Personal Baseline", description: "Versioned profile and membership provenance", sources: [["personal-baseline", "Profiles"], ["baseline-membership", "Membership audit"]] },
   { key: "analytical-records", label: "Analytical Records", description: "Five-minute analysis periods", sources: [["analytical-records", "Feature windows"]] },
+  { key: "validation", label: "Validation", description: "Versioned calculations, inclusion decisions and incident-match audit", sources: [["validation-metrics", "Metric calculations"], ["validation-decisions", "Evidence decisions"], ["validation-matches", "Incident matching"]] },
 ];
 
 function display(value: unknown): string {

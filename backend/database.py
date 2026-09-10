@@ -1433,6 +1433,9 @@ EXPANDED_HEALTH_ASSESSMENT_COLUMNS = {
 
 EXPANDED_VALIDATION_PERIOD_COLUMNS = {
     "closed_at_utc": "TEXT",
+    "declared_outcome": "TEXT NOT NULL DEFAULT 'not_declared'",
+    "related_incident_id": "INTEGER",
+    "eligibility_state": "TEXT NOT NULL DEFAULT 'not_evaluated'",
 }
 
 EXPANDED_ALERT_FEEDBACK_COLUMNS = {
@@ -1453,6 +1456,20 @@ EXPANDED_VALIDATION_RUN_COLUMNS = {
     "distinct_observation_days": "INTEGER NOT NULL DEFAULT 0",
     "data_confidence": "REAL NOT NULL DEFAULT 0",
     "confidence_level": "TEXT NOT NULL DEFAULT 'insufficient'",
+    "eligible_observation_period_count": "INTEGER NOT NULL DEFAULT 0",
+    "observation_coverage": "REAL",
+    "maturity_label": "TEXT NOT NULL DEFAULT 'insufficient'",
+    "additional_positive_needed": "INTEGER NOT NULL DEFAULT 0",
+    "additional_negative_needed": "INTEGER NOT NULL DEFAULT 0",
+    "validation_start_utc": "TEXT",
+    "validation_end_utc": "TEXT",
+}
+
+EXPANDED_VALIDATION_METRIC_COLUMNS = {
+    "confidence_interval_lower": "REAL",
+    "confidence_interval_upper": "REAL",
+    "confidence_interval_method": "TEXT",
+    "maturity_label": "TEXT NOT NULL DEFAULT 'insufficient'",
 }
 
 # Phase 1 databases are migrated by adding only missing nullable columns.
@@ -1784,6 +1801,30 @@ def initialize_database(database_path: Path | None = None) -> Path:
                 connection.rollback()
                 raise
             return path
+        if version == 18:
+            # Schema 19 extends validation only. Replaying the older baseline
+            # migration finalizers here would rebuild immutable archived
+            # membership audit data, so migrate this path narrowly.
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                for table_name, columns in (
+                    (
+                        "validation_observation_periods",
+                        EXPANDED_VALIDATION_PERIOD_COLUMNS,
+                    ),
+                    ("validation_evaluation_runs", EXPANDED_VALIDATION_RUN_COLUMNS),
+                    ("validation_metric_results", EXPANDED_VALIDATION_METRIC_COLUMNS),
+                ):
+                    _add_missing_columns(connection, table_name, columns)
+                connection.execute(POSTCALIBRATION_SCHEMA_STATEMENTS[-1])
+                for statement in POSTCALIBRATION_INDEXES[-2:]:
+                    connection.execute(statement)
+                connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            return path
         if version >= SCHEMA_VERSION:
             enhanced_tables = {
                 row[0]
@@ -1990,6 +2031,11 @@ def initialize_database(database_path: Path | None = None) -> Path:
                 EXPANDED_VALIDATION_RUN_COLUMNS,
             )
             connection.execute(CREATE_VALIDATION_METRICS_TABLE)
+            _add_missing_columns(
+                connection,
+                "validation_metric_results",
+                EXPANDED_VALIDATION_METRIC_COLUMNS,
+            )
             connection.execute(CREATE_WARNING_LEAD_TIMES_TABLE)
             connection.execute(CREATE_VALIDATION_INCLUSION_TABLE)
             for statement in ENHANCED_SCHEMA_STATEMENTS:
